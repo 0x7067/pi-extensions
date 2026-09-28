@@ -35,6 +35,13 @@ const LOOKUP_TOOL = { name: "lookup", description: "Look something up.", paramet
 const LOOKUP_SDK_NAME = "mcp__custom-tools__lookup";
 
 const user = (text) => ({ role: "user", content: [{ type: "text", text }], timestamp: Date.now() });
+const ONE_PIXEL_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+const userWithImage = (text) => ({ role: "user", content: [{ type: "text", text }, { type: "image", data: ONE_PIXEL_PNG, mimeType: "image/png" }], timestamp: Date.now() });
+const assistantReply = (text) => ({
+	role: "assistant", provider: "claude-bridge", api: "claude-bridge", model: HAIKU.id, stopReason: "stop", timestamp: Date.now(),
+	usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+	content: [{ type: "text", text }],
+});
 const toolResult = (toolCall, text) => ({ role: "toolResult", toolCallId: toolCall.id, toolName: toolCall.name, content: [{ type: "text", text }], isError: false, timestamp: Date.now() });
 const toolCallsOf = (message) => message.content.filter((block) => block.type === "toolCall");
 const textOf = (message) => message.content.filter((block) => block.type === "text").map((block) => block.text).join("");
@@ -257,6 +264,48 @@ describe("Claude Code contract", { timeout: 60_000, skip: claudeBinary ? false :
 
 		assert.equal(textOf(firstReply), "answer to alpha");
 		assert.equal(textOf(secondReply), "answer to beta");
+	});
+
+	it("after a reply that was only thinking, the next message reaches Claude without a fake reply", async () => {
+		const bridge = newBridge();
+		let answer;
+		respond = () => answer === undefined ? { thinking: "I should look at the screenshot first." } : { text: answer };
+
+		const history = [user("Simplify the copy on this screen.")];
+		const silent = await bridge.call(HAIKU, history);
+		assert.equal(textOf(silent), "", "precondition: Claude ended the turn without a visible reply");
+
+		answer = "Here is the plan for the copy and the notices.";
+		history.push(silent, user("I also mean the notices at the top."));
+		const reply = await bridge.call(HAIKU, history);
+
+		assert.equal(textOf(reply), "Here is the plan for the copy and the notices.");
+		const request = fakeApi.requests.at(-1);
+		assert.equal(hasFakeReply(request), false);
+		const parts = request.messages.flatMap((message) => message.parts);
+		assert.ok(parts.some((part) => part.includes("Simplify the copy on this screen.")));
+		assert.ok(request.messages.at(-1).parts.some((part) => part.includes("I also mean the notices at the top.")));
+	});
+
+	it("a screenshot in a prompt Claude picks up from rebuilt history reaches Claude", async () => {
+		const bridge = newBridge();
+		respond = () => ({ text: "Simplified." });
+
+		// A settings notice between the last reply and the prompt means the prompt
+		// is answered from the rebuilt history rather than sent as a new message.
+		const reply = await bridge.call(HAIKU, [
+			user("Show me the connectors screen."),
+			assistantReply("Here it is."),
+			user("The user changed this session's reasoning settings to xhigh effort."),
+			userWithImage("Can we simplify this screen?"),
+		]);
+
+		assert.equal(textOf(reply), "Simplified.");
+		const request = fakeApi.requests.at(-1);
+		assert.equal(hasFakeReply(request), false);
+		const last = request.messages.at(-1);
+		assert.ok(last.parts.some((part) => part.includes("Can we simplify this screen?")));
+		assert.ok(last.parts.includes("[image]"), "the screenshot must reach Claude with the prompt");
 	});
 
 	it("a stopped turn's unexecuted tool calls are not replayed or reported as lost output", async () => {

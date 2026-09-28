@@ -4,6 +4,7 @@
  *
  * Every request is recorded. `respond(request)` decides the reply:
  *   { text }                       stream an assistant text reply
+ *   { thinking }                   stream a reply that is only a thinking block
  *   { toolUse: { id, name, input } } stream a single tool call
  *   { status, message }            return an API error
  */
@@ -28,6 +29,14 @@ function streamReply(res, model, reply) {
 			{ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: JSON.stringify(input ?? {}) } },
 			{ type: "content_block_stop", index: 0 },
 			{ type: "message_delta", delta: { stop_reason: "tool_use", stop_sequence: null }, usage: { output_tokens: 10 } },
+		);
+	} else if (reply.thinking) {
+		events.push(
+			{ type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "", signature: "" } },
+			{ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: reply.thinking } },
+			{ type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "fake-signature" } },
+			{ type: "content_block_stop", index: 0 },
+			{ type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 10 } },
 		);
 	} else {
 		events.push(
