@@ -1104,6 +1104,15 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 //
 // Log strings still say "Case 1/2/3/4" so existing diagnostics (int-cache.sh,
 // int-session-resume.mjs) keep grepping the same anchors.
+//
+// A reply with no text and no tool call (Claude ended the turn after thinking
+// only) is not a reply to Claude Code: it drops such messages when it loads a
+// session, so a copy ending on one ends on the message before it.
+function isVisibleReply(message: Context["messages"][number]): boolean {
+	return message.role === "assistant" && message.content.some((block) =>
+		block.type === "toolCall" || (block.type === "text" && block.text.trim() !== ""));
+}
+
 function syncSharedSession(
 	messages: Context["messages"],
 	cwd: string,
@@ -1116,8 +1125,7 @@ function syncSharedSession(
 	// REUSE path
 	if (endsWithUserPrompt && bridgeRuntime().sharedSession && !bridgeRuntime().sharedSession.needsRebuild) {
 		const missed = priorMessages.slice(bridgeRuntime().sharedSession.cursor);
-		const trailingAssistantOnly =
-			missed.length === 1 && (missed[0] as { role?: string }).role === "assistant";
+		const trailingAssistantOnly = missed.length === 1 && isVisibleReply(missed[0]);
 		if (missed.length === 0 || trailingAssistantOnly) {
 			if (trailingAssistantOnly) {
 				bridgeRuntime().sharedSession = { ...bridgeRuntime().sharedSession, cursor: priorMessages.length, cwd };
@@ -1130,8 +1138,10 @@ function syncSharedSession(
 
 	// REBUILD path. Normalize exactly as Pi does for every other provider:
 	// aborted/errored assistant turns are dropped and unanswered tool calls get
-	// an error result. Pi's own history is never modified.
-	const history = transformMessages(messages, model);
+	// an error result. Replies Claude Code would drop are left out, so the
+	// prompt they did not answer counts as unanswered. Pi's own history is
+	// never modified.
+	const history = transformMessages(messages, model).filter((message) => message.role !== "assistant" || isVisibleReply(message));
 	let lastAssistant = history.length - 1;
 	while (lastAssistant >= 0 && history[lastAssistant].role !== "assistant") lastAssistant--;
 	const tail = history.slice(lastAssistant + 1);

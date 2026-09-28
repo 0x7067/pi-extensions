@@ -20,6 +20,7 @@ Implementation details for contributors. End-user setup, settings, and troublesh
 - Pi history is canonical. The Claude session file is a copy: resumed while Pi history matches the bridge's cursor, otherwise rebuilt from Pi history.
 - Rebuilds normalize history with Pi's `transformMessages` (from `@earendil-works/pi-ai/api/transform-messages`), the same rules every Pi provider uses: aborted and errored assistant turns are dropped and unanswered tool calls get an error result.
 - When the normalized history does not end in "Claude's last reply, then the new prompt" (an unanswered prompt after Stop or an error, or tool results Pi continues from after compaction), the whole history is written to the copy and Claude Code answers its unanswered end via `CLAUDE_CODE_RESUME_INTERRUPTED_TURN`.
+- A reply with no text and no tool call (Claude ended the turn after thinking only) does not count as Claude's last reply. Claude Code drops such messages when it loads a session, so resuming on one would leave the copy ending on a user-role message. The copy is rebuilt without it, and the prompt it did not answer is answered with the new one.
 
 ## Context window and errors
 
