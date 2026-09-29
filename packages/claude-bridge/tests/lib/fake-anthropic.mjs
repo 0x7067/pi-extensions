@@ -69,7 +69,7 @@ export function describeMessage(message) {
 	};
 }
 
-export async function startFakeAnthropic(respond) {
+export async function startFakeAnthropic(respond, { authorize } = {}) {
 	const requests = [];
 	const server = createServer((req, res) => {
 		let body = "";
@@ -77,6 +77,11 @@ export async function startFakeAnthropic(respond) {
 		req.on("end", () => {
 			if (req.method !== "POST" || !req.url?.startsWith("/v1/messages")) {
 				res.writeHead(404).end();
+				return;
+			}
+			if (authorize && !authorize(req.headers)) {
+				res.writeHead(401, { "content-type": "application/json" });
+				res.end(JSON.stringify({ type: "error", error: { type: "authentication_error", message: "Synthetic test credentials were rejected." } }));
 				return;
 			}
 			const parsed = JSON.parse(body || "{}");

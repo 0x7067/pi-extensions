@@ -41,6 +41,8 @@ The bridge only provides this mechanism. Pi installations and embedding hosts ch
 
 Embedding hosts that run multiple sibling Pi runtimes in one process should use `@fractaal/pi-claude-bridge/isolated`. Every factory invocation owns independent session, tool, UI, and query state. The default package entry preserves personal Pi's nested-agent behavior, where reloaded extension instances share one model registry.
 
+The factory also accepts `env`, an optional map of Claude child-process environment overrides. Hosts can supply a runtime-specific gateway endpoint, credential or `CLAUDE_CONFIG_DIR` without changing `process.env` or another runtime. Setting an entry to `undefined` suppresses its inherited value. Overrides are copied when the extension is registered; executable discovery, native session-copy paths and Claude subprocesses use the same effective environment. Normal Pi configuration and the bridge's tool/MCP isolation remain unchanged. Keep credentials in the host's runtime configuration, not persisted bridge settings or source.
+
 ## Settings
 
 Open `/extensions:settings`; settings appear under the **Claude Bridge** tab.

@@ -8,7 +8,7 @@
  */
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readdirSync, rmSync, symlinkSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -51,12 +51,12 @@ let workDir;
 let fakeApi;
 let respond;
 
-function newBridge() {
+function newBridge(env) {
 	const handlers = new Map();
 	const notifications = [];
 	let provider;
 	const cwd = mkdtempSync(join(workDir, "session-"));
-	createClaudeBridgeExtension({ userDir: join(workDir, "user") })({
+	createClaudeBridgeExtension({ userDir: join(workDir, "user"), env })({
 		registerCommand() {},
 		on(event, handler) { handlers.set(event, handler); },
 		registerProvider(_id, config) { provider = config; },
@@ -264,6 +264,40 @@ describe("Claude Code contract", { timeout: 60_000, skip: claudeBinary ? false :
 
 		assert.equal(textOf(firstReply), "answer to alpha");
 		assert.equal(textOf(secondReply), "answer to beta");
+	});
+
+	it("sibling runtimes use their own endpoint, credential and native profile without changing the parent", async () => {
+		const inherited = { endpoint: process.env.ANTHROPIC_BASE_URL, key: process.env.ANTHROPIC_API_KEY, profile: process.env.CLAUDE_CONFIG_DIR };
+		const firstApi = await startFakeAnthropic(() => ({ text: "first runtime reply", delayMs: 40 }), {
+			authorize: headers => headers.authorization === "Bearer synthetic-first-authority" && headers["x-api-key"] === undefined,
+		});
+		const secondApi = await startFakeAnthropic(() => ({ text: "second runtime reply", delayMs: 40 }), {
+			authorize: headers => headers.authorization === "Bearer synthetic-second-authority" && headers["x-api-key"] === undefined,
+		});
+		const firstProfile = join(workDir, "first-profile");
+		const secondProfile = join(workDir, "second-profile");
+		try {
+			const first = newBridge({ ANTHROPIC_BASE_URL: firstApi.url, ANTHROPIC_AUTH_TOKEN: "synthetic-first-authority", ANTHROPIC_API_KEY: undefined, CLAUDE_CONFIG_DIR: firstProfile });
+			const second = newBridge({ ANTHROPIC_BASE_URL: secondApi.url, ANTHROPIC_AUTH_TOKEN: "synthetic-second-authority", ANTHROPIC_API_KEY: undefined, CLAUDE_CONFIG_DIR: secondProfile });
+			// Prior history requires the bridge and native subprocess to agree on the profile path.
+			const [firstReply, secondReply] = await Promise.all([
+				first.call(HAIKU, [user("first history"), assistantReply("first earlier answer"), user("first follow-up")]),
+				second.call(HAIKU, [user("second history"), assistantReply("second earlier answer"), user("second follow-up")]),
+			]);
+			assert.equal(textOf(firstReply), "first runtime reply");
+			assert.equal(textOf(secondReply), "second runtime reply");
+			const firstText = firstApi.requests.flatMap(request => request.messages.flatMap(message => message.parts)).join("\n");
+			const secondText = secondApi.requests.flatMap(request => request.messages.flatMap(message => message.parts)).join("\n");
+			assert.ok(firstText.includes("first history") && !firstText.includes("second history"));
+			assert.ok(secondText.includes("second history") && !secondText.includes("first history"));
+			assert.ok(readdirSync(firstProfile, { recursive: true }).some(file => file.endsWith(".jsonl")));
+			assert.ok(readdirSync(secondProfile, { recursive: true }).some(file => file.endsWith(".jsonl")));
+			assert.equal(process.env.ANTHROPIC_BASE_URL, inherited.endpoint);
+			assert.equal(process.env.ANTHROPIC_API_KEY, inherited.key);
+			assert.equal(process.env.CLAUDE_CONFIG_DIR, inherited.profile);
+		} finally {
+			await Promise.all([firstApi.close(), secondApi.close()]);
+		}
 	});
 
 	it("after a reply that was only thinking, the next message reaches Claude without a fake reply", async () => {
