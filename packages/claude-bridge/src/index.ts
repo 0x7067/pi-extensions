@@ -497,13 +497,14 @@ interface BridgeRuntimeState {
 	extraUsageHelperInFlight: Promise<string> | null;
 	query: QueryRuntimeState;
 	userDir: string | undefined;
+	envOverrides: NodeJS.ProcessEnv | undefined;
 	// The Pi session's working directory. Pi passes no cwd to providers, and the
 	// host process's cwd (e.g. Symphony's launch directory) is not the workspace.
 	sessionCwd: string | undefined;
 	usage: ClaudeUsageReader;
 }
 
-function createBridgeRuntimeState(userDir?: string): BridgeRuntimeState {
+function createBridgeRuntimeState(userDir?: string, env?: NodeJS.ProcessEnv): BridgeRuntimeState {
 	const runtime: BridgeRuntimeState = {
 		sharedSession: null,
 		extensionApi: undefined,
@@ -511,6 +512,7 @@ function createBridgeRuntimeState(userDir?: string): BridgeRuntimeState {
 		extraUsageHelperInFlight: null,
 		query: createQueryRuntimeState(),
 		userDir,
+		envOverrides: env ? { ...env } : undefined,
 		sessionCwd: undefined,
 		usage: createClaudeUsageReader({
 			// Hosts (e.g. Aria Local Runtime) listen for this to show plan quota.
@@ -526,6 +528,16 @@ const bridgeRuntimeStorage = new AsyncLocalStorage<BridgeRuntimeState>();
 
 function bridgeRuntime(): BridgeRuntimeState {
 	return bridgeRuntimeStorage.getStore() ?? defaultBridgeRuntime;
+}
+
+function claudeEnvironment(): NodeJS.ProcessEnv {
+	return { ...process.env, ...bridgeRuntime().envOverrides, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1" };
+}
+
+function claudeConfigDirectory(): string | undefined {
+	const env = claudeEnvironment();
+	const home = process.platform === "win32" ? env.USERPROFILE : env.HOME;
+	return env.CLAUDE_CONFIG_DIR || (home ? join(home, ".claude") : undefined);
 }
 
 function loadBridgeConfig(cwd: string): Config {
@@ -764,14 +776,15 @@ function sdkTextFromMessage(message: SDKMessage): string | undefined {
 
 async function runExtraUsageHelper(cwd: string, config = loadBridgeConfig(cwd)): Promise<string> {
 	const providerSettings = config.provider ?? {};
-	const claudeExecutable = resolveClaudeCodeExecutable({ configuredPath: providerSettings.pathToClaudeCodeExecutable })?.executablePath;
+	const env = claudeEnvironment();
+	const claudeExecutable = resolveClaudeCodeExecutable({ configuredPath: providerSettings.pathToClaudeCodeExecutable, env })?.executablePath;
 	if (claudeExecutable) preflightClaudeExecutable(claudeExecutable, cwd);
 
 	const helperQuery = query({
 		prompt: "/extra-usage",
 		options: {
 			cwd,
-			env: { ...process.env, ENABLE_CLAUDEAI_MCP_SERVERS: "0", DISABLE_AUTO_COMPACT: "1" },
+			env: { ...env, ENABLE_CLAUDEAI_MCP_SERVERS: "0", DISABLE_AUTO_COMPACT: "1" },
 			maxTurns: 1,
 			...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
 			spawnClaudeCodeProcess: spawnClaudeCodeWithDiagnostics,
@@ -851,7 +864,7 @@ function latestPersistedBridgeSession(sessionManager: unknown): PersistedBridgeS
 
 function claudeSessionExists(sessionId: string, cwd: string): boolean {
 	try {
-		const session = openSession({ sessionId, projectPath: cwd, claudeDir: process.env.CLAUDE_CONFIG_DIR });
+		const session = openSession({ sessionId, projectPath: cwd, claudeDir: claudeConfigDirectory() });
 		statSync(session.jsonlPath);
 		return true;
 	} catch {
@@ -1052,7 +1065,7 @@ function verifyWrittenSession(
 	const warnings = _verifyWrittenSession(jsonlPath, expectedSessionId, expectedRecordCount);
 	for (const msg of warnings) {
 		debug(`WARNING session verify: ${msg}`);
-		diagDump("session_verify_fail", { msg, jsonlPath, cwd, realpath: safeRealpath(cwd), claudeConfigDir: process.env.CLAUDE_CONFIG_DIR ?? null });
+		diagDump("session_verify_fail", { msg, jsonlPath, cwd, realpath: safeRealpath(cwd), claudeConfigDir: claudeConfigDirectory() ?? null });
 	}
 }
 
@@ -1076,7 +1089,7 @@ function debugSessionPaths(label: string, cwd: string, jsonlPath: string): void 
 	if (realCwd !== cwd) debug(`${label}: realpath(cwd)=${realCwd} (DIFFERS — symlink-resolved path is what CC SDK uses)`);
 	debug(`${label}: jsonlPath=${jsonlPath}`);
 	debug(`${label}: fileExists=${fileExists}${fileSize != null ? ` size=${fileSize}` : ""}`);
-	debug(`${label}: env.CLAUDE_CONFIG_DIR=${process.env.CLAUDE_CONFIG_DIR ?? "(unset)"} HOME=${process.env.HOME ?? "(unset)"}`);
+	debug(`${label}: CLAUDE_CONFIG_DIR=${claudeConfigDirectory() ?? "(unset)"}`);
 }
 
 // Two semantic paths:
@@ -1168,11 +1181,11 @@ function syncSharedSession(
 	const preserveId = previousSessionId !== undefined && !bridgeRuntime().sharedSession?.forceRotate;
 	if (preserveId) {
 		// Wipe prior jsonl + companion dir (no-op if nothing to wipe).
-		deleteSession(previousSessionId!, cwd, process.env.CLAUDE_CONFIG_DIR);
+		deleteSession(previousSessionId!, cwd, claudeConfigDirectory());
 	}
 	const session = createSession({
 		projectPath: cwd,
-		claudeDir: process.env.CLAUDE_CONFIG_DIR,
+		claudeDir: claudeConfigDirectory(),
 		...(preserveId ? { sessionId: previousSessionId } : {}),
 		model: model.id,
 	});
@@ -2024,7 +2037,8 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 			? undefined
 			: providerSettings.settingSources ?? ["user", "project"];
 	const strictMcpConfigEnabled = !appendSystemPrompt && providerSettings.strictMcpConfig !== false;
-	const claudeExecutable = resolveClaudeCodeExecutable({ configuredPath: providerSettings.pathToClaudeCodeExecutable })?.executablePath;
+	const env = claudeEnvironment();
+	const claudeExecutable = resolveClaudeCodeExecutable({ configuredPath: providerSettings.pathToClaudeCodeExecutable, env })?.executablePath;
 	const claudeExecutablePreflight = claudeExecutable ? preflightClaudeExecutable(claudeExecutable, cwd) : undefined;
 	const { sessionId: resumeSessionId, rescue } = syncSharedSession(context.messages, cwd, model, customToolNameToSdk);
 
@@ -2080,7 +2094,7 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 	// threshold with CC's, including CC's anti-thrashing guard (issue #8).
 	// Manual /compact in CC still works (we never invoke it).
 	const childEnv = {
-		...process.env,
+		...env,
 		ENABLE_CLAUDEAI_MCP_SERVERS: "0",
 		DISABLE_AUTO_COMPACT: "1",
 		...(rescue ? { CLAUDE_CODE_RESUME_INTERRUPTED_TURN: "1" } : {}),
@@ -2361,19 +2375,18 @@ function registerBridgeCommands(pi: ExtensionAPI, run: RunInBridgeRuntime): void
 
 export interface ClaudeBridgeExtensionOptions {
 	userDir?: string;
+	/** Claude child/profile environment overrides. Undefined values suppress inherited keys. */
+	env?: NodeJS.ProcessEnv;
 }
 
-function registerClaudeBridge(pi: ExtensionAPI, userDir?: string) {
-	const runtime = createBridgeRuntimeState(userDir);
+function registerClaudeBridge(pi: ExtensionAPI, options: ClaudeBridgeExtensionOptions) {
+	const runtime = createBridgeRuntimeState(options.userDir, options.env);
 	const run: RunInBridgeRuntime = callback => runWithBridgeRuntime(runtime, callback);
 	const boundStream = ((model: Model<any>, context: Context, options?: SimpleStreamOptions) =>
 		run(() => streamClaudeAgentSdk(model, context, options))) as typeof streamClaudeAgentSdk;
 
 	return run(() => {
 		bridgeRuntime().extensionApi = pi;
-		// Disable non-essential Claude Code traffic (update checks, MCP registry, telemetry)
-		process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1";
-
 		const config = loadBridgeConfig(process.cwd());
 		debug("loadConfig:", JSON.stringify(config));
 		registerBridgeCommands(pi, run);
@@ -2445,7 +2458,7 @@ function registerClaudeBridge(pi: ExtensionAPI, userDir?: string) {
 }
 
 export function createClaudeBridgeExtension(options: ClaudeBridgeExtensionOptions = {}) {
-	return (pi: ExtensionAPI) => registerClaudeBridge(pi, options.userDir);
+	return (pi: ExtensionAPI) => registerClaudeBridge(pi, options);
 }
 
 export default createClaudeBridgeExtension();
