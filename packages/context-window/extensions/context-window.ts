@@ -2,8 +2,8 @@ import { existsSync } from 'node:fs';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join, parse as parsePath } from 'node:path';
-import type { Api, Model } from '@earendil-works/pi-ai';
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext, ProviderModelConfig } from '@earendil-works/pi-coding-agent';
+import type { Api, Model, Provider } from '@earendil-works/pi-ai';
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import lockfile from 'proper-lockfile';
 import {
   CONTEXT_WINDOW_GLOBAL_DEFAULTS_FILE,
@@ -165,28 +165,11 @@ function isNotFound(error: unknown): boolean {
   return error !== null && typeof error === 'object' && 'code' in error && (error as { code?: unknown }).code === 'ENOENT';
 }
 
-function providerModelConfig(model: Model<Api>, contextWindow: number): ProviderModelConfig {
-  return {
-    id: model.id,
-    name: model.name,
-    api: model.api,
-    reasoning: model.reasoning,
-    thinkingLevelMap: model.thinkingLevelMap,
-    input: model.input,
-    cost: model.cost,
-    contextWindow,
-    maxTokens: model.maxTokens,
-    ...(model.baseUrl ? { baseUrl: model.baseUrl } : {}),
-    ...(model.headers ? { headers: model.headers } : {}),
-    ...(model.compat ? { compat: model.compat } : {}),
-  };
-}
-
 export default function contextWindowExtension(pi: ExtensionAPI): void {
   let state: ContextWindowState | null = null;
   let defaults: ContextWindowDefaults = { schemaVersion: GLOBAL_DEFAULTS_FILE_VERSION, defaults: {} };
   let runtimeContext: ExtensionContext | null = null;
-  const originalModels = new Map<string, readonly Model<Api>[]>();
+  const originalProviders = new Map<string, Provider>();
   let applying = false;
 
   function emitState(): void {
@@ -199,31 +182,32 @@ export default function contextWindowExtension(pi: ExtensionAPI): void {
     emitState();
   }
 
-  function captureProvider(providerId: string, registry: ModelRegistryLike): readonly Model<Api>[] {
-    const existing = originalModels.get(providerId);
+  function captureProvider(providerId: string, registry: ModelRegistryLike): Provider {
+    const existing = originalProviders.get(providerId);
     if (existing) return existing;
     const provider = registry.getProvider(providerId);
-    const models = provider?.getModels() ?? [];
-    originalModels.set(providerId, models);
-    return models;
+    if (!provider) throw new Error(`Provider ${providerId} is unavailable.`);
+    originalProviders.set(providerId, provider);
+    return provider;
   }
 
   async function applyModel(model: Model<Api>, ctx: ExtensionContext, shouldPersist: boolean): Promise<void> {
     const ref = modelRef(model);
     if (!ref) return;
-    const originals = captureProvider(ref.provider, ctx.modelRegistry);
+    const provider = captureProvider(ref.provider, ctx.modelRegistry);
     const sessionOverride = state?.sessionOverride ?? null;
-    const models = originals.map((candidate) => {
-      const globalDefault = defaults.defaults[modelKey({ provider: candidate.provider, modelId: candidate.id })] ?? null;
-      const cap = candidate.id === model.id && sessionOverride !== null
-        ? sessionOverride
-        : globalDefault;
-      const contextWindow = effectiveContextWindow(modelMax(candidate), cap, null);
-      return providerModelConfig(candidate, contextWindow);
+    // Decorate the live catalog, not a captured model array. Native refresh,
+    // authentication, streaming and additional capabilities remain provider-owned.
+    pi.registerProvider({
+      ...provider,
+      getModels: () => provider.getModels().map((candidate) => {
+        const globalDefault = defaults.defaults[modelKey({ provider: candidate.provider, modelId: candidate.id })] ?? null;
+        const cap = candidate.id === model.id && sessionOverride !== null ? sessionOverride : globalDefault;
+        return { ...candidate, contextWindow: effectiveContextWindow(modelMax(candidate), cap, null) };
+      }),
     });
-    pi.registerProvider(ref.provider, { models });
     const replacement = ctx.modelRegistry.find(ref.provider, ref.modelId);
-    const maxWindow = modelMax(originals.find((candidate) => candidate.id === ref.modelId) ?? model);
+    const maxWindow = modelMax(provider.getModels().find((candidate) => candidate.id === ref.modelId) ?? model);
     const globalDefault = defaults.defaults[modelKey(ref)] ?? null;
     const next = stateFor(
       { ...model, contextWindow: maxWindow } as Model<Api>,
@@ -231,7 +215,7 @@ export default function contextWindowExtension(pi: ExtensionAPI): void {
       sessionOverride,
       globalDefault,
     );
-    if (replacement && replacement.contextWindow !== next.effectiveWindow && !applying) {
+    if (replacement && ctx.model?.contextWindow !== replacement.contextWindow && !applying) {
       applying = true;
       try {
         await pi.setModel(replacement);
