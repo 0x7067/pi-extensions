@@ -1,6 +1,6 @@
 {
   "name": "@fractaal/pi-context-window",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Portable per-session and per-model context-window budgets for Pi",
   "license": "MIT",
   "author": "pi-context-window contributors",
