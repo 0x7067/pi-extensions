@@ -43,6 +43,17 @@ describe('Claude model discovery', () => {
     assert.equal(existsSync(started.options.cwd), false);
   });
 
+  it('allows the SDK-bundled Claude executable when no separate CLI is installed, as on Neo', async () => {
+    let started;
+    const result = await discoverClaudeModels({
+      env: { PATH: '' },
+      startQuery: (input) => { started = input; return { supportedModels: async () => discovery, close() {} }; },
+    });
+    assert.equal(result, discovery);
+    assert.equal(started.options.pathToClaudeCodeExecutable, undefined);
+    assert.equal(started.options.env.PATH, '');
+  });
+
   it('cancels a stalled initialization and closes its subprocess instead of blocking the host', async () => {
     const controller = new AbortController();
     let started;
@@ -74,6 +85,14 @@ describe('Claude model discovery', () => {
     assert.deepEqual(added.thinkingLevelMap, { off: null, minimal: 'low', low: 'low', medium: null, high: 'high', xhigh: null, max: 'max' });
     for (const key of ['api', 'provider', 'baseUrl', 'headers']) assert.equal(added[key], undefined);
     assert.deepEqual(missingMetadata, []);
+  });
+
+  it('retains a native long-context selector while using the underlying model metadata', () => {
+    const result = mergeClaudeModelDiscovery([], [{ ...discovery[0], resolvedModel: 'claude-new-model[1m]' }], [metadata()]);
+    assert.deepEqual(result.missingMetadata, []);
+    assert.equal(result.models[0].id, 'claude-new-model[1m]');
+    assert.equal(result.models[0].contextWindow, 1_000_000);
+    assert.match(result.models[0].name, /\(1M\)$/);
   });
 
   it('persists new models through Pi model storage and can restore them offline in a new runtime', async () => {

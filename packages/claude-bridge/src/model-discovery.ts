@@ -38,7 +38,6 @@ export interface ClaudeModelDiscoveryOptions {
 export async function discoverClaudeModels(options: ClaudeModelDiscoveryOptions = {}): Promise<ModelInfo[]> {
   const env = { ...process.env, ...options.env };
   const executablePath = options.executablePath ?? resolveClaudeCodeExecutable({ env })?.executablePath;
-  if (!executablePath) throw new Error('Claude model discovery requires an installed Claude Code executable.');
   const signal = AbortSignal.any([AbortSignal.timeout(15_000), ...(options.signal ? [options.signal] : [])]);
   signal.throwIfAborted();
   const cwd = await mkdtemp(join(tmpdir(), 'pi-claude-models-'));
@@ -51,7 +50,7 @@ export async function discoverClaudeModels(options: ClaudeModelDiscoveryOptions 
     session = (options.startQuery ?? query)({
       prompt: input,
       options: {
-        cwd, pathToClaudeCodeExecutable: executablePath, abortController,
+        cwd, ...(executablePath ? { pathToClaudeCodeExecutable: executablePath } : {}), abortController,
         tools: [], mcpServers: {}, settingSources: [], persistSession: false,
         settings: { disableAllHooks: true }, extraArgs: { 'strict-mcp-config': null },
         env: { ...env, ENABLE_CLAUDEAI_MCP_SERVERS: '0' },
@@ -94,7 +93,10 @@ export function mergeClaudeModelDiscovery(
     const id = info.resolvedModel ?? info.value;
     // Aliases without a resolved wire ID aren't stable persisted selections.
     if (!id.startsWith('claude-')) continue;
-    const known = details.get(id);
+    // Claude Code can resolve an alias to a wire selector such as opus[1m].
+    // Keep that selector for execution, but look up its underlying model's data.
+    const metadataId = id.endsWith('[1m]') ? id.slice(0, -4) : id;
+    const known = details.get(id) ?? details.get(metadataId);
     if (!known) { missingMetadata.push(id); continue; }
     let thinkingLevelMap = known.thinkingLevelMap;
     if (info.supportedEffortLevels?.length) {
@@ -105,7 +107,7 @@ export function mergeClaudeModelDiscovery(
       }));
     }
     models.set(id, {
-      ...known, id, thinkingLevelMap,
+      ...known, id, name: id === metadataId ? known.name : `${known.name} (1M)`, thinkingLevelMap,
       reasoning: info.supportsEffort ?? info.supportsAdaptiveThinking ?? known.reasoning,
     });
   }

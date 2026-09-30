@@ -32,7 +32,7 @@ Restart Pi after installation.
 
 ## Model discovery
 
-On Pi model-catalog refresh, the bridge asks the installed Claude Code for its supported models through a short-lived initialization: no prompt, tools, MCP servers, hooks, or persisted conversation. It resolves aliases to canonical IDs and uses `pi.dev`'s Anthropic catalog for context/output limits and pricing. Prices are list-price estimates, not a statement of subscription charges. Neither credentials nor provider request headers are sent to `pi.dev`.
+On Pi model-catalog refresh, the bridge asks its selected Claude Code executable (including the SDK-bundled CLI on managed hosts) for its supported models through a short-lived initialization: no prompt, tools, MCP servers, hooks, or persisted conversation. It resolves aliases to canonical IDs and uses `pi.dev`'s Anthropic catalog for context/output limits and pricing. Prices are list-price estimates, not a statement of subscription charges. Neither credentials nor provider request headers are sent to `pi.dev`.
 
 Discovered models are additive and stored in Pi's existing `ModelsStore`; the bundled list is an offline baseline, not an inclusion limit. Cache-only startup performs no discovery, ordinary refreshes reuse a four-hour cache, and Pi's forced refresh bypasses that interval. Failed discovery keeps the last-known catalog. If a newly advertised model has no usable limit metadata yet, the bridge reports it through the UI and `claude-bridge:model-discovery-warning` rather than inventing capabilities; later refreshes can add it once metadata is available.
 
