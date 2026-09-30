@@ -15,6 +15,7 @@ import { dirname, join } from "path";
 import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
 import { resolveClaudeCodeExecutable } from "./executable-resolution.js";
 import { FABLE_FALLBACK_MODEL_ID, FABLE_MODEL_ID, buildModels, fallbackModelForPrimaryModel } from "./models.js";
+import { createClaudeModelCatalog, discoverClaudeModels } from "./model-discovery.js";
 import { PromptInput } from "./prompt-input.js";
 import { CLAUDE_USAGE_EVENT, createClaudeUsageReader, type ClaudeUsageReader } from "./usage.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, extractSkillsBlock } from "./skills.js";
@@ -2435,11 +2436,24 @@ function registerClaudeBridge(pi: ExtensionAPI, options: ClaudeBridgeExtensionOp
 		pi.on("session_compact", () => run(() => markRebuild("session_compact")));
 		pi.on("session_tree", () => run(() => markRebuild("session_tree")));
 
+		const catalog = createClaudeModelCatalog({
+			initialModels: MODELS,
+			discover: (signal) => run(() => {
+				const cwd = bridgeRuntime().sessionCwd ?? process.cwd();
+				const configured = loadBridgeConfig(cwd).provider?.pathToClaudeCodeExecutable;
+				return discoverClaudeModels({ env: claudeEnvironment(), executablePath: configured, signal });
+			}),
+			warn: (message) => run(() => {
+				pi.events.emit("claude-bridge:model-discovery-warning", { message });
+				bridgeRuntime().piUI?.notify(message, "warning");
+			}),
+		});
 		const providerConfig = {
 			baseUrl: "claude-bridge",
 			apiKey: "not-used",
 			api: "claude-bridge" as const,
 			models: MODELS,
+			refreshModels: catalog.refresh,
 			streamSimple: boundStream as any,
 		};
 		if (isolatedModule) {
