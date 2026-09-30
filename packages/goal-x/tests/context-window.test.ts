@@ -7,6 +7,13 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { afterEach, test } from 'node:test';
 import {
+  ModelRuntime,
+  SessionManager,
+  SettingsManager,
+  createAgentSessionFromServices,
+  createAgentSessionServices,
+} from '@earendil-works/pi-coding-agent';
+import {
   CONTEXT_WINDOW_GLOBAL_DEFAULTS_FILE,
   CONTEXT_WINDOW_STATE_ENTRY,
   CONTEXT_WINDOW_STATE_EVENT,
@@ -229,6 +236,61 @@ test('a context budget preserves discovery and native provider behavior without 
   assert.equal(getModel().id, 'newly-discovered');
   assert.equal(getModel().contextWindow, 96_000, 'the session cap also applies after selecting a discovered model');
   assert.equal(parseContextWindowState(harness.entries.at(-1)?.data)?.maxWindow, 400_000);
+});
+
+test('a configured 872k ceiling allows real Pi budget changes without overriding the 272k default', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'portable-context-window-configured-max-'));
+  temporaryDirectories.push(root);
+  const modelsPath = join(root, 'models.json');
+  const configuredModels = `${JSON.stringify({
+    providers: { openai: { modelOverrides: { 'gpt-5.6-sol': { contextWindow: 872_000 } } } },
+  })}\n`;
+  writeFileSync(modelsPath, configuredModels);
+  writeFileSync(join(root, CONTEXT_WINDOW_GLOBAL_DEFAULTS_FILE), JSON.stringify({
+    schemaVersion: 1,
+    defaults: { 'openai/gpt-5.6-sol': 272_000 },
+  }));
+  const modelRuntime = await ModelRuntime.create({ modelsPath, authPath: join(root, 'auth.json'), allowModelNetwork: false });
+  await modelRuntime.setRuntimeApiKey('openai', 'fixture-no-provider-requests', { allowNetwork: false });
+  const services = await createAgentSessionServices({
+    cwd: root,
+    agentDir: root,
+    modelRuntime,
+    settingsManager: SettingsManager.inMemory(),
+    resourceLoaderOptions: {
+      extensionFactories: [contextWindowExtension],
+      noExtensions: true,
+      noSkills: true,
+      noThemes: true,
+      noContextFiles: true,
+      noPromptTemplates: true,
+    },
+  });
+  const model = modelRuntime.getModel('openai', 'gpt-5.6-sol');
+  assert.ok(model);
+  const { session } = await createAgentSessionFromServices({
+    services,
+    sessionManager: SessionManager.create(root, join(root, 'sessions')),
+    model,
+  });
+  const errors: unknown[] = [];
+  try {
+    await session.bindExtensions({ mode: 'rpc', onError: (error) => errors.push(error) });
+    assert.deepEqual(errors, []);
+    assert.equal(session.model?.contextWindow, 272_000, 'the default must reach the active Pi model');
+    for (const [input, expected] of [['872k', 872_000], ['128k', 128_000], ['max', 872_000], ['1m', 872_000], ['default', 272_000]] as const) {
+      await session.prompt(`/context-window ${input}`);
+      assert.equal(session.model?.contextWindow, expected, `active model after ${input}`);
+      const stateEntry = session.sessionManager.getEntries().slice().reverse().find((entry) => entry.type === 'custom' && entry.customType === CONTEXT_WINDOW_STATE_ENTRY);
+      const state = parseContextWindowState(stateEntry?.type === 'custom' ? stateEntry.data : null);
+      assert.equal(state?.maxWindow, 872_000);
+      assert.equal(state?.effectiveWindow, expected, 'reported state must match the actual budget');
+      assert.equal(session.model?.maxTokens, model.maxTokens, 'output allowance is not changed');
+    }
+    assert.equal(readFileSync(modelsPath, 'utf8'), configuredModels, 'the configured model ceiling is not rewritten');
+  } finally {
+    session.dispose();
+  }
 });
 
 test('malformed persisted state fails closed instead of falling back to an older state', async () => {

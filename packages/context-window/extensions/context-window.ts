@@ -215,10 +215,12 @@ export default function contextWindowExtension(pi: ExtensionAPI): void {
       sessionOverride,
       globalDefault,
     );
-    if (replacement && ctx.model?.contextWindow !== replacement.contextWindow && !applying) {
+    if (replacement && ctx.model?.contextWindow !== next.effectiveWindow && !applying) {
       applying = true;
       try {
-        await pi.setModel(replacement);
+        // models.json remains the configured ceiling in the registry. Apply the
+        // selected budget to the active model as well, not the uncapped entry.
+        await pi.setModel({ ...replacement, contextWindow: next.effectiveWindow });
       } finally {
         applying = false;
       }
