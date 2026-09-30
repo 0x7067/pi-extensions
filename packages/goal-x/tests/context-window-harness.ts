@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { Api, Model } from '@earendil-works/pi-ai';
+import type { Api, Model, Provider } from '@earendil-works/pi-ai';
 import { createHarness } from './harness.ts';
 
 export type FixtureModel = Model<Api>;
@@ -26,9 +26,25 @@ export function installModelHarness(
 ) {
   const harness = createHarness(initialEntries, root);
   let current = models[0]!;
-  const providers = new Map<string, FixtureModel[]>();
+  const catalogs = new Map<string, FixtureModel[]>();
+  const providers = new Map<string, Provider>();
+  const discovered = new Map<string, FixtureModel[]>();
   for (const model of models) {
-    providers.set(model.provider, [...(providers.get(model.provider) ?? []), model]);
+    catalogs.set(model.provider, [...(catalogs.get(model.provider) ?? []), model]);
+  }
+  for (const id of catalogs.keys()) {
+    providers.set(id, {
+      id,
+      name: id,
+      auth: { apiKey: { name: 'Fixture', resolve: async () => ({ auth: {} }) } },
+      getModels: () => catalogs.get(id) ?? [],
+      refreshModels: async () => {
+        const next = discovered.get(id);
+        if (next) catalogs.set(id, next);
+      },
+      stream: () => { throw new Error('fixture streaming available'); },
+      streamSimple: () => { throw new Error('fixture streaming available'); },
+    });
   }
   Object.assign(harness.ctx, {
     model: current,
@@ -37,27 +53,14 @@ export function installModelHarness(
       getSessionFile: () => join(root, 'sessions', 'fixture.jsonl'),
     },
     modelRegistry: {
-      getProvider: (provider: string) => {
-        const registered = providers.get(provider);
-        return registered ? { getModels: () => registered } : undefined;
-      },
-      find: (provider: string, modelId: string) => providers.get(provider)?.find((model) => model.id === modelId),
-      getAvailable: () => [...providers.values()].flat(),
+      getProvider: (provider: string) => providers.get(provider),
+      find: (provider: string, modelId: string) => providers.get(provider)?.getModels().find((model) => model.id === modelId),
+      getAvailable: () => [...providers.values()].flatMap((provider) => provider.getModels()),
     },
   });
   Object.assign(harness.pi, {
-    registerProvider: (provider: string, config: { models?: FixtureModel[] }) => {
-      if (!config.models?.length) throw new Error('fixture provider registration was empty');
-      const registered = config.models.map((model) => ({ ...model, provider } as FixtureModel));
-      providers.set(provider, registered);
-      const replacement = current.provider === provider
-        ? registered.find((model) => model.id === current.id)
-        : undefined;
-      if (replacement) {
-        current = replacement;
-        Object.assign(harness.ctx, { model: replacement });
-      }
-    },
+    // Like Pi, replacing a provider changes the registry, not the active model.
+    registerProvider: (provider: Provider) => { providers.set(provider.id, provider); },
     setModel: async (next: FixtureModel) => {
       current = next;
       Object.assign(harness.ctx, { model: next });
@@ -69,8 +72,9 @@ export function installModelHarness(
   return {
     harness,
     getModel: () => current,
+    discoverModels: (provider: string, next: FixtureModel[]) => { discovered.set(provider, next); },
     selectModel(provider: string, modelId: string): FixtureModel {
-      const selected = providers.get(provider)?.find((model) => model.id === modelId);
+      const selected = providers.get(provider)?.getModels().find((model) => model.id === modelId);
       if (!selected) throw new Error(`Unknown fixture model ${provider}/${modelId}`);
       current = selected;
       Object.assign(harness.ctx, { model: selected });

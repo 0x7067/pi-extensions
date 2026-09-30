@@ -210,6 +210,34 @@ test('independent Pi processes preserve concurrent per-model global-default upda
   }
 });
 
+test('a context budget preserves discovery and native provider behavior without switching the active model', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'portable-context-window-discovery-'));
+  temporaryDirectories.push(root);
+  const { harness, getModel, discoverModels, selectModel } = installModelHarness(root);
+  contextWindowExtension(harness.pi);
+  await harness.run('session_start', { reason: 'startup' });
+  await harness.commands.get('context-window')!.handler('96k', harness.ctx as never);
+  const selected = getModel();
+  const provider = harness.ctx.modelRegistry.getProvider('fixture')!;
+  discoverModels('fixture', [fixtureModel(), fixtureModel('fixture', 'newly-discovered', 400_000)]);
+
+  await provider.refreshModels?.({
+    allowNetwork: true,
+    store: { read: async () => undefined, write: async () => {}, delete: async () => {} },
+  });
+
+  assert.equal(getModel(), selected, 'discovery does not change the active session model');
+  assert.equal(getModel().contextWindow, 96_000);
+  assert.equal(provider.getModels().find((model) => model.id === 'newly-discovered')?.contextWindow, 400_000);
+  assert.ok(await provider.auth.apiKey?.resolve({ ctx: { env: async () => undefined } } as never));
+  assert.throws(() => provider.streamSimple(selected, { messages: [] }), /fixture streaming available/);
+  const next = selectModel('fixture', 'newly-discovered');
+  await harness.run('model_select', { type: 'model_select', model: next, source: 'set' });
+  assert.equal(getModel().id, 'newly-discovered');
+  assert.equal(getModel().contextWindow, 96_000, 'the session cap also applies after selecting a discovered model');
+  assert.equal(parseContextWindowState(harness.entries.at(-1)?.data)?.maxWindow, 400_000);
+});
+
 test('a configured 872k ceiling allows real Pi budget changes without overriding the 272k default', async () => {
   const root = mkdtempSync(join(tmpdir(), 'portable-context-window-configured-max-'));
   temporaryDirectories.push(root);
