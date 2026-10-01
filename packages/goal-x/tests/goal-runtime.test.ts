@@ -360,6 +360,7 @@ test("Goal semantic state is byte-stable in the system prompt and never floated 
 	assert.match(firstPrompt, /An active Goal continues by default/);
 	assert.match(firstPrompt, /set_goal_blocked is an exceptional factual claim/);
 	assert.match(firstPrompt, /"Continue the Goal\." messages are automatic reprompts from the Goal extension, not from the user\. They never answer your questions, approve anything, or give permission/);
+	assert.match(firstPrompt, /If nothing else can advance the Goal until the user replies to a decision you put to them, call wait_goal\./);
 	assert.doesNotMatch(firstPrompt, /pause_goal|call pause|revision=|goalId=|tokensUsed|activeSeconds|updatedAt/);
 
 	const revisionBeforeAccounting = latestGoalState(harness.entries).revision;

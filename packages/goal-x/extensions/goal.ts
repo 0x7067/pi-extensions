@@ -171,6 +171,7 @@ function renderGoalSystemPrompt(state: GoalState): string {
 	if (goal.status === "active") {
 		lines.push("An active Goal continues by default. Do not stop at a progress report: if any safe, in-scope action can materially advance any part of the objective, take it.");
 		lines.push("When the only remaining progress depends on external state that takes time, call wait_goal instead of polling or stopping.");
+		lines.push("If nothing else can advance the Goal until the user replies to a decision you put to them, call wait_goal.");
 		lines.push("set_goal_blocked is an exceptional factual claim that autonomous progress is currently impossible. It is not a way to defer work, request review, or hand back an unfinished objective.");
 		lines.push("Call abandon_goal only when the Goal should be abandoned, or complete_goal only after the objective is genuinely complete.");
 	} else if (goal.status === "paused" && isGoalBlockedPause(goal.pause)) {
@@ -596,7 +597,7 @@ export default function goalExtension(
 		description: `Choose when the active Goal next continues, from ${GOAL_WAIT_MIN_SECONDS} to ${GOAL_WAIT_MAX_SECONDS} seconds from now, instead of continuing immediately. The Goal stays active; any user message or event before then wakes you sooner.`,
 		promptSnippet: "Wait for external state before the Goal continues.",
 		promptGuidelines: [
-			"Use wait_goal only when no safe, in-scope action can advance the Goal until external state changes, such as a build, deploy, review, or long-running process. It is not a way to defer work that can be done now.",
+			"Use wait_goal only when no safe, in-scope action can advance the Goal until external state changes, such as a build, deploy, review, long-running process, or the user's reply to a decision you put to them. It is not a way to defer work that can be done now.",
 			"Match delaySeconds to what you are waiting for: one check when it should be done beats many short polls. If it is still not ready when you wake, wait again.",
 		],
 		parameters: Type.Object({
