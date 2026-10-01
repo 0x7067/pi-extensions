@@ -12,6 +12,7 @@ import {
 	GOAL_COMPLETION_AUDITOR_REPORT_MAX_LENGTH,
 	GOAL_COMPLETION_SUMMARY_MAX_LENGTH,
 	GOAL_CONTINUATION_MESSAGE,
+	GOAL_CONTINUATION_TEXT,
 	GOAL_OBJECTIVE_MAX_LENGTH,
 	GOAL_UNBLOCK_CONDITION_MAX_LENGTH,
 	GOAL_WAIT_MIN_SECONDS,
@@ -85,11 +86,13 @@ test("confirmed Goal sends one generic durable continuation at idle and blocked 
 	assert.deepEqual(harness.sent, [{
 		message: {
 			customType: GOAL_CONTINUATION_MESSAGE,
-			content: "Continue the Goal.",
+			content: GOAL_CONTINUATION_TEXT,
 			display: false,
 		},
 		options: { deliverAs: "followUp", triggerTurn: true },
 	}]);
+	assert.match(GOAL_CONTINUATION_TEXT, /^<system_message source="goal_extension">\n[\s\S]*Continue the Goal\.\n<\/system_message>$/, "Pi delivers custom messages in the user role, so the continuation is tagged as a Goal extension message");
+	assert.match(GOAL_CONTINUATION_TEXT, /not a message from the user\. It does not answer anything you asked the user, approve anything, or give permission/);
 
 	await executeTool(harness, "set_goal_blocked", blockProof("The required API key is unavailable.", "API_KEY is configured."));
 	const blocked = latestGoalState(harness.entries).goal;
@@ -151,6 +154,43 @@ test("native human pause remains paused while model-owned blocking stays unavail
 	assert.match((prompt[0] as { systemPrompt?: string }).systemPrompt ?? "", /The Goal is paused by the user/);
 	harness.runIdle();
 	assert.equal(harness.sent.length, 0, "human pause also makes the activation callback harmless");
+});
+
+test("a confirmed revision resumes a blocked or human-paused Goal and a declined one leaves it paused", async (t) => {
+	for (const [label, stop] of [
+		["blocked", (harness: ReturnType<typeof harnessWithGoal>) => executeTool(harness, "set_goal_blocked", blockProof("The deploy target is wrong."))],
+		["human-paused", async (harness: ReturnType<typeof harnessWithGoal>) => { await harness.commands.get("goal-pause")?.handler("Paused to rethink scope.", harness.ctx); }],
+	] as const) {
+		await t.test(label, async () => {
+			const harness = harnessWithGoal(async () => ({ approved: false, output: "not used\n<disapproved/>" }));
+			await harness.run("session_start", { reason: "startup" });
+			harness.confirmations.push(true);
+			await executeTool(harness, "propose_goal", { objective: "Deploy to staging" });
+			harness.runIdle();
+			await stop(harness);
+			assert.equal(latestGoalState(harness.entries).goal?.status, "paused");
+
+			harness.confirmations.push(false);
+			await executeTool(harness, "tweak_goal", { objective: "Deploy to production" });
+			harness.runIdle();
+			assert.equal(latestGoalState(harness.entries).goal?.status, "paused", "a declined revision changes nothing");
+			assert.equal(harness.sent.length, 1);
+
+			harness.confirmations.push(true);
+			const result = await executeTool(harness, "tweak_goal", { objective: "Deploy to production" });
+			assert.match(String(result.content?.[0]?.text), /Goal revision confirmed\. Autonomous continuation is active\./);
+			const revised = latestGoalState(harness.entries).goal;
+			assert.equal(revised?.objective, "Deploy to production");
+			assert.equal(revised?.status, "active");
+			assert.equal(revised?.autoContinue, true);
+			assert.equal(Object.hasOwn(revised ?? {}, "pause"), false);
+			const receipt = [...harness.events.emitted].reverse().find((event) => event.channel === GOAL_TRANSCRIPT_EVENT) as { data?: { kind?: string; changeSummary?: string } } | undefined;
+			assert.equal(receipt?.data?.kind, "goal_updated");
+			assert.match(receipt?.data?.changeSummary ?? "", /the Goal resumed/);
+			harness.runIdle();
+			assert.equal(harness.sent.length, 2, "the confirmed revision starts exactly one continuation");
+		});
+	}
 });
 
 test("malformed legacy block-like pauses stay human-paused through replay and resume", async (t) => {
@@ -319,6 +359,8 @@ test("Goal semantic state is byte-stable in the system prompt and never floated 
 	assert.match(firstPrompt, /Original objective/);
 	assert.match(firstPrompt, /An active Goal continues by default/);
 	assert.match(firstPrompt, /set_goal_blocked is an exceptional factual claim/);
+	assert.match(firstPrompt, /"Continue the Goal\." messages are automatic reprompts from the Goal extension, not from the user\. They never answer your questions, approve anything, or give permission/);
+	assert.match(firstPrompt, /If nothing else can advance the Goal until the user replies to a decision you put to them, call wait_goal\./);
 	assert.doesNotMatch(firstPrompt, /pause_goal|call pause|revision=|goalId=|tokensUsed|activeSeconds|updatedAt/);
 
 	const revisionBeforeAccounting = latestGoalState(harness.entries).revision;

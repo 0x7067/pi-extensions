@@ -1,6 +1,6 @@
 {
   "name": "@fractaal/pi-goal-x",
-  "version": "0.28.10",
+  "version": "0.28.11",
   "description": "Portable single-goal runtime for Pi",
   "license": "MIT",
   "author": "pi-goal-x contributors",

@@ -10,6 +10,13 @@ export const GOAL_PROPOSAL_EVENT = "pi-goal:proposal";
 export const GOAL_AUDIT_EVENT = "pi-goal:audit";
 export const GOAL_AUDIT_EVENT_VERSION = 1 as const;
 export const GOAL_CONTINUATION_MESSAGE = "pi-goal-continuation-v1";
+// Pi delivers custom messages in the user role, so the constant text must say it is not from the user.
+export const GOAL_CONTINUATION_TEXT = [
+	"<system_message source=\"goal_extension\">",
+	"Automatic reprompt from the Goal extension, not a message from the user. It does not answer anything you asked the user, approve anything, or give permission; any decision you put to the user is still pending.",
+	"Continue the Goal.",
+	"</system_message>",
+].join("\n");
 // A model-chosen wake lives in its own entry so the Goal state shape never changes.
 export const GOAL_WAKE_ENTRY = "pi-goal-wake-v1";
 export const GOAL_WAIT_MIN_SECONDS = 60;

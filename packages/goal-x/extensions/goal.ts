@@ -11,6 +11,7 @@ import {
 	GOAL_COMPLETION_AUDITOR_REPORT_MAX_LENGTH,
 	GOAL_COMPLETION_SUMMARY_MAX_LENGTH,
 	GOAL_CONTINUATION_MESSAGE,
+	GOAL_CONTINUATION_TEXT,
 	GOAL_OBJECTIVE_MAX_LENGTH,
 	GOAL_PROPOSAL_COMMENT_MAX_LENGTH,
 	GOAL_PAUSE_REASON_MAX_LENGTH,
@@ -58,7 +59,6 @@ export * from "./goal-contract.ts";
 export * from "./goal-transcript-events.ts";
 export * from "./legacy-migration.ts";
 
-const GOAL_CONTINUATION_TEXT = "Continue the Goal.";
 const REQUIRED_PI_CODING_AGENT_VERSION = "0.84.1";
 
 type IdleExtensionContext = ExtensionContext & {
@@ -166,10 +166,12 @@ function renderGoalSystemPrompt(state: GoalState): string {
 		"<goal_objective>",
 		goal.objective.replace(/<\/?goal_objective>/gi, (tag) => tag.replaceAll("<", "&lt;").replaceAll(">", "&gt;")),
 		"</goal_objective>",
+		"\"Continue the Goal.\" messages are automatic reprompts from the Goal extension, not from the user. They never answer your questions, approve anything, or give permission; a decision you put to the user stays pending until the user replies.",
 	];
 	if (goal.status === "active") {
 		lines.push("An active Goal continues by default. Do not stop at a progress report: if any safe, in-scope action can materially advance any part of the objective, take it.");
 		lines.push("When the only remaining progress depends on external state that takes time, call wait_goal instead of polling or stopping.");
+		lines.push("If nothing else can advance the Goal until the user replies to a decision you put to them, call wait_goal.");
 		lines.push("set_goal_blocked is an exceptional factual claim that autonomous progress is currently impossible. It is not a way to defer work, request review, or hand back an unfinished objective.");
 		lines.push("Call abandon_goal only when the Goal should be abandoned, or complete_goal only after the objective is genuinely complete.");
 	} else if (goal.status === "paused" && isGoalBlockedPause(goal.pause)) {
@@ -533,7 +535,7 @@ export default function goalExtension(
 	pi.registerTool({
 		name: "tweak_goal",
 		label: "Tweak Goal",
-		description: "Propose a complete revised objective for the current Goal. The revision applies only after user confirmation.",
+		description: "Propose a complete revised objective for the current Goal. The revision applies only after user confirmation, which also resumes a blocked or paused Goal.",
 		promptSnippet: "Propose a confirmed revision to the current Goal objective.",
 		promptGuidelines: ["Use Markdown to create your Goal proposal.", "Use tweak_goal when user feedback changes the current Goal contract; pass the complete revised objective, not a patch."],
 		parameters: Type.Object({ objective: Type.String({ minLength: 1, maxLength: GOAL_OBJECTIVE_MAX_LENGTH }) }, { additionalProperties: false }),
@@ -550,12 +552,20 @@ export default function goalExtension(
 				clearProposal();
 			}
 			if (!decision.confirmed) return { content: [{ type: "text", text: proposalResultText("Goal revision declined. The current Goal is unchanged.", decision.comment) }], details: state };
-			const { lastAuditRejection: _lastAuditRejection, ...revisedGoal } = goal;
-			const next: Goal = { ...revisedGoal, objective, updatedAt: nowIso() };
+			// The user's confirmation of the revised contract is also the go-ahead, so a blocked or paused Goal resumes.
+			const resumed = goal.status !== "active";
+			const { lastAuditRejection: _lastAuditRejection, pause: _pause, ...revisedGoal } = goal;
+			const next: Goal = { ...revisedGoal, objective, status: "active", autoContinue: true, updatedAt: nowIso() };
 			persist(next, ctx);
-			publishReceipt({ kind: "goal_updated", level: "info", ...goalFields(next), changeSummary: "Goal objective revised with user confirmation.", tuiMessage: "Goal updated." });
-			if (next.status === "active") requestContinuation(ctx);
-			return { content: [{ type: "text", text: proposalResultText("Goal revision confirmed.", decision.comment) }], details: state, terminate: true };
+			publishReceipt({
+				kind: "goal_updated",
+				level: "info",
+				...goalFields(next),
+				changeSummary: resumed ? "Goal objective revised with user confirmation; the Goal resumed." : "Goal objective revised with user confirmation.",
+				tuiMessage: resumed ? "Goal updated and resumed." : "Goal updated.",
+			});
+			requestContinuation(ctx);
+			return { content: [{ type: "text", text: proposalResultText("Goal revision confirmed. Autonomous continuation is active.", decision.comment) }], details: state, terminate: true };
 		},
 	});
 
@@ -587,7 +597,7 @@ export default function goalExtension(
 		description: `Choose when the active Goal next continues, from ${GOAL_WAIT_MIN_SECONDS} to ${GOAL_WAIT_MAX_SECONDS} seconds from now, instead of continuing immediately. The Goal stays active; any user message or event before then wakes you sooner.`,
 		promptSnippet: "Wait for external state before the Goal continues.",
 		promptGuidelines: [
-			"Use wait_goal only when no safe, in-scope action can advance the Goal until external state changes, such as a build, deploy, review, or long-running process. It is not a way to defer work that can be done now.",
+			"Use wait_goal only when no safe, in-scope action can advance the Goal until external state changes, such as a build, deploy, review, long-running process, or the user's reply to a decision you put to them. It is not a way to defer work that can be done now.",
 			"Match delaySeconds to what you are waiting for: one check when it should be done beats many short polls. If it is still not ready when you wake, wait again.",
 		],
 		parameters: Type.Object({
