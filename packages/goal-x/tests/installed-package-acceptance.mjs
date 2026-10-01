@@ -352,10 +352,14 @@ async function exerciseInstalledGoal(loadExtensions, profile, workspace) {
 	assert.equal(latest(harness.entries, "pi-goal-state-v1").goal.status, "active");
 	assert.equal(harness.sent.length, 0, "packed Goal waits for Pi's idle boundary");
 	harness.flushIdle();
-	assert.deepEqual(harness.sent, [{
-		message: { customType: "pi-goal-continuation-v1", content: "Continue the Goal.", display: false },
+	assert.equal(harness.sent.length, 1);
+	const { content: continuationText, ...continuation } = harness.sent[0].message;
+	assert.deepEqual({ message: continuation, options: harness.sent[0].options }, {
+		message: { customType: "pi-goal-continuation-v1", display: false },
 		options: { deliverAs: "followUp", triggerTurn: true },
-	}], "packed Goal queues the exact generic continuation without Goal identity");
+	}, "packed Goal queues the generic continuation as a hidden follow-up");
+	assert.match(continuationText, /^<system_message source="goal_extension">[\s\S]*not a message from the user[\s\S]*Continue the Goal\.\n<\/system_message>$/, "packed continuation identifies itself as an automatic Goal reprompt");
+	assert.doesNotMatch(continuationText, /Exercise the packed Goal lifecycle/, "continuation carries no Goal identity");
 	await harness.tool("set_goal_blocked", blockArgs("Acceptance prerequisite is absent."));
 	const blockedState = latest(harness.entries, "pi-goal-state-v1").goal;
 	assert.equal(blockedState.status, "paused");
@@ -370,6 +374,7 @@ async function exerciseInstalledGoal(loadExtensions, profile, workspace) {
 	const promptResult = await harness.run("before_agent_start", promptEvent);
 	assert.match(promptResult[0].systemPrompt, /^INSTALLED BASE PROMPT\n\n\[PI GOAL ACTIVE\]/);
 	assert.match(promptResult[0].systemPrompt, /Exercise the packed Goal lifecycle/);
+	assert.match(promptResult[0].systemPrompt, /"Continue the Goal\." messages are automatic reprompts from the Goal extension, not from the user/);
 	assert.doesNotMatch(promptResult[0].systemPrompt, /revision=|goalId=|tokensUsed|activeSeconds/);
 	assert.equal((await harness.run("context", { messages: [] })).length, 0, "packed Goal registers no per-provider context transform");
 	await harness.run("agent_end", { messages: [{ role: "assistant", stopReason: "stop", content: [] }] });
