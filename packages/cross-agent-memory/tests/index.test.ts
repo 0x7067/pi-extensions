@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import crossAgentMemory, { buildCrossAgentMemoryPromptAppend, createCrossAgentMemoryExtension, projectMemorySlug, resolveCrossAgentMemoryFiles } from '../src/index.js';
+import { buildCrossAgentMemoryPromptAppend, createCrossAgentMemoryExtension, projectMemorySlug, resolveCrossAgentMemoryFiles } from '../src/index.js';
 
 const tempRoots: string[] = [];
 
@@ -55,28 +55,39 @@ describe('project memory slug', () => {
 });
 
 describe('resolveCrossAgentMemoryFiles', () => {
-  it('loads Claude project memory and Codex global memory for the cwd', async () => {
+  it.each(['.codex', '.Codex'])('loads Claude project memory and the %s global summary, not its handbook', async (codexDirectory) => {
     const home = await tempRoot();
     const cwd = join(home, 'Projects', 'demo');
     await mkdir(cwd, { recursive: true });
     const claudeMemory = join(home, '.claude', 'projects', projectMemorySlug(cwd), 'memory', 'MEMORY.md');
-    const codexGlobalMemory = join(home, '.codex', 'memories', 'MEMORY.md');
+    const codexSummary = join(home, codexDirectory, 'memories', 'memory_summary.md');
     await writeMemory(claudeMemory, 'Claude project memory.\n');
-    await writeMemory(codexGlobalMemory, 'Codex global memory.\n');
+    await writeMemory(codexSummary, 'Codex summary.\n');
+    await writeMemory(join(home, codexDirectory, 'memories', 'MEMORY.md'), 'Detailed Codex handbook.\n');
 
     const files = await resolveCrossAgentMemoryFiles({ cwd, homeDir: home });
 
-    expect(files.map((file) => file.path)).toEqual([claudeMemory, codexGlobalMemory]);
-    expect(files.map((file) => file.content)).toEqual(['Claude project memory.\n', 'Codex global memory.\n']);
+    expect(files.map((file) => file.path)).toEqual([claudeMemory, codexSummary]);
+    expect(files.map((file) => file.content)).toEqual(['Claude project memory.\n', 'Codex summary.\n']);
   });
 
-  it('deduplicates case-only alternate Codex paths and symlink aliases after loading', async () => {
+  it.each([undefined, ''])('does not inject the handbook when the summary is %s', async (summary) => {
     const home = await tempRoot();
     const cwd = join(home, 'Projects', 'demo');
     await mkdir(cwd, { recursive: true });
-    const codexLower = join(home, '.codex', 'memories', 'MEMORY.md');
-    const codexUpper = join(home, '.Codex', 'memories', 'MEMORY.md');
-    await writeMemory(codexLower, 'Codex global memory.\n');
+    await writeMemory(join(home, '.codex', 'memories', 'MEMORY.md'), 'Detailed Codex handbook.\n');
+    if (summary !== undefined) await writeMemory(join(home, '.codex', 'memories', 'memory_summary.md'), summary);
+
+    expect(await buildCrossAgentMemoryPromptAppend({ cwd, homeDir: home })).toBe('');
+  });
+
+  it('includes a Codex summary once when alternate paths alias the same file', async () => {
+    const home = await tempRoot();
+    const cwd = join(home, 'Projects', 'demo');
+    await mkdir(cwd, { recursive: true });
+    const codexLower = join(home, '.codex', 'memories', 'memory_summary.md');
+    const codexUpper = join(home, '.Codex', 'memories', 'memory_summary.md');
+    await writeMemory(codexLower, 'Codex summary.\n');
     try {
       await mkdir(dirname(codexUpper), { recursive: true });
       await symlink(codexLower, codexUpper);
@@ -94,13 +105,21 @@ describe('resolveCrossAgentMemoryFiles', () => {
     const cwd = join(home, 'Projects', 'demo');
     await mkdir(cwd, { recursive: true });
     const claudeMemory = join(home, '.claude', 'projects', projectMemorySlug(cwd), 'memory', 'MEMORY.md');
+    const codexSummary = join(home, '.codex', 'memories', 'memory_summary.md');
+    const codexHandbook = join(home, '.codex', 'memories', 'MEMORY.md');
     await writeMemory(claudeMemory, 'Claude host prompt memory.\n');
+    await writeMemory(codexSummary, 'Codex summary for prompt hosts.\n');
+    await writeMemory(codexHandbook, 'Detailed Codex handbook.\n');
 
     const promptAppend = await buildCrossAgentMemoryPromptAppend({ cwd, homeDir: home });
 
     expect(promptAppend).toContain('# cross-agent memory');
     expect(promptAppend).toContain('Claude host prompt memory.');
     expect(promptAppend).toContain(claudeMemory);
+    expect(promptAppend).toContain('Codex summary for prompt hosts.');
+    expect(promptAppend).toContain(codexSummary);
+    expect(promptAppend).toContain(codexHandbook);
+    expect(promptAppend).not.toContain('Detailed Codex handbook.');
   });
 
   it('skips directory matches and respects file and total byte budgets', async () => {
@@ -110,7 +129,7 @@ describe('resolveCrossAgentMemoryFiles', () => {
     const slug = projectMemorySlug(cwd);
     const claudeMemory = join(home, '.claude', 'projects', slug, 'memory', 'MEMORY.md');
     const codexProjectDirectoryAtMemoryPath = join(home, '.codex', 'projects', slug, 'memory', 'MEMORY.md');
-    const codexGlobalMemory = join(home, '.codex', 'memories', 'MEMORY.md');
+    const codexGlobalMemory = join(home, '.codex', 'memories', 'memory_summary.md');
     await writeMemory(claudeMemory, 'A'.repeat(20));
     await mkdir(codexProjectDirectoryAtMemoryPath, { recursive: true });
     await writeMemory(codexGlobalMemory, 'B'.repeat(20));
@@ -241,7 +260,4 @@ describe('Pi extension', () => {
     expect(continued.systemPrompt).not.toContain('OTHER');
   });
 
-  it('default export is a Pi extension function', () => {
-    expect(typeof crossAgentMemory).toBe('function');
-  });
 });

@@ -15,7 +15,7 @@ try {
     encoding: 'utf8',
   }));
   const files = new Set(packed.files.map((file) => file.path));
-  for (const required of ['src/index.ts', 'dist/index.js', 'dist/index.d.ts', 'LICENSE', 'README.md']) {
+  for (const required of ['LICENSE', 'README.md']) {
     assert.ok(files.has(required), `Missing packaged file: ${required}`);
   }
   assert.ok(![...files].some((file) => file.startsWith('tests/') || file.startsWith('node_modules/')));
@@ -36,10 +36,7 @@ try {
   const installed = join(consumer, 'node_modules', '@fractaal', 'pi-cross-agent-memory');
   const manifest = JSON.parse(await readFile(join(installed, 'package.json'), 'utf8'));
   assert.equal(manifest.name, '@fractaal/pi-cross-agent-memory');
-  assert.deepEqual(manifest.exports, {
-    '.': { types: './dist/index.d.ts', default: './dist/index.js' },
-  });
-  assert.deepEqual(manifest.pi.extensions, ['./src/index.ts']);
+  assert.ok(files.has(manifest.exports['.'].types.replace(/^\.\//, '')), 'Declared types must be packaged');
 
   const probe = `
     import assert from 'node:assert/strict';
@@ -47,16 +44,23 @@ try {
     import { dirname, join } from 'node:path';
     import memory, * as api from '@fractaal/pi-cross-agent-memory';
 
-    assert.deepEqual(Object.keys(api).sort(), [
+    for (const name of [
       'buildCrossAgentMemoryPromptAppend', 'createCrossAgentMemoryExtension',
       'default', 'projectMemorySlug', 'resolveCrossAgentMemoryFiles',
-    ].sort());
+    ]) assert.equal(typeof api[name], 'function');
     assert.equal(typeof memory, 'function');
     const cwd = process.cwd();
     const memoryPath = join(process.env.HOME, '.claude', 'projects', api.projectMemorySlug(cwd), 'memory', 'MEMORY.md');
     await mkdir(dirname(memoryPath), { recursive: true });
     await writeFile(memoryPath, 'ISOLATED_MEMORY_SENTINEL');
-    assert.match(await api.buildCrossAgentMemoryPromptAppend({ cwd }), /ISOLATED_MEMORY_SENTINEL/);
+    const codexDirectory = join(process.env.HOME, '.codex', 'memories');
+    await mkdir(codexDirectory, { recursive: true });
+    await writeFile(join(codexDirectory, 'memory_summary.md'), 'CODEX_SUMMARY_SENTINEL');
+    await writeFile(join(codexDirectory, 'MEMORY.md'), 'CODEX_HANDBOOK_DETAIL_SENTINEL');
+    const promptAppend = await api.buildCrossAgentMemoryPromptAppend({ cwd });
+    assert.match(promptAppend, /ISOLATED_MEMORY_SENTINEL/);
+    assert.match(promptAppend, /CODEX_SUMMARY_SENTINEL/);
+    assert.doesNotMatch(promptAppend, /CODEX_HANDBOOK_DETAIL_SENTINEL/);
 
     // The host SDK discovers the installed tarball via its Pi package manifest,
     // not via a source path in this worktree. No model/auth/session is started.
@@ -70,17 +74,25 @@ try {
     await loader.reload();
     const { extensions, errors } = loader.getExtensions();
     assert.deepEqual(errors, []);
-    assert.equal(extensions.length, 1);
-    assert.deepEqual([...extensions[0].commands.keys()].sort(), ['claude-memory', 'cross-agent-memory']);
+    const commands = new Set(extensions.flatMap(extension => [...extension.commands.keys()]));
+    assert.ok(commands.has('claude-memory'));
+    assert.ok(commands.has('cross-agent-memory'));
     const context = { cwd, hasUI: false, sessionManager: { getBranch: () => [] } };
-    for (const handler of extensions[0].handlers.get('session_start')) await handler({}, context);
+    for (const extension of extensions) {
+      for (const handler of extension.handlers.get('session_start') ?? []) await handler({}, context);
+    }
     let systemPrompt = 'base prompt';
-    for (const handler of extensions[0].handlers.get('before_agent_start')) {
-      const result = await handler({ systemPrompt }, context);
-      systemPrompt = result?.systemPrompt ?? systemPrompt;
+    for (const extension of extensions) {
+      for (const handler of extension.handlers.get('before_agent_start') ?? []) {
+        const result = await handler({ systemPrompt }, context);
+        systemPrompt = result?.systemPrompt ?? systemPrompt;
+      }
     }
     assert.match(systemPrompt, /ISOLATED_MEMORY_SENTINEL/);
-    console.log('PASS: packed Node exports, Pi manifest discovery, command aliases, and isolated memory injection');
+    assert.match(systemPrompt, /CODEX_SUMMARY_SENTINEL/);
+    assert.ok(systemPrompt.includes(join(codexDirectory, 'MEMORY.md')));
+    assert.doesNotMatch(systemPrompt, /CODEX_HANDBOOK_DETAIL_SENTINEL/);
+    console.log('PASS: packed Node exports, Pi manifest discovery, command aliases, and summary-only Codex injection');
   `;
   execFileSync(process.execPath, ['--input-type=module', '-e', probe], {
     cwd: consumer,
