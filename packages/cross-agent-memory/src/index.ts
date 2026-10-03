@@ -237,8 +237,8 @@ function codexProjectMemoryCandidates(homeDir: string, projectDirectory: string)
 
 function codexGlobalMemoryCandidates(homeDir: string): MemoryCandidate[] {
   return [
-    { kind: 'codex-global-memory', label: 'Codex global MEMORY.md', path: join(homeDir, '.codex', 'memories', 'MEMORY.md') },
-    { kind: 'codex-global-memory', label: 'Codex global MEMORY.md', path: join(homeDir, '.Codex', 'memories', 'MEMORY.md') },
+    { kind: 'codex-global-memory', label: 'Codex global memory summary', path: join(homeDir, '.codex', 'memories', 'memory_summary.md') },
+    { kind: 'codex-global-memory', label: 'Codex global memory summary', path: join(homeDir, '.Codex', 'memories', 'memory_summary.md') },
   ];
 }
 
@@ -327,6 +327,9 @@ function formatMemoryFile(file: CrossAgentMemoryFile): string {
     `<cross-agent-memory-file ${metadata}>`,
     file.content,
   ];
+  if (file.kind === 'codex-global-memory') {
+    lines.push('', `For detailed Codex memory, read relevant sections of \`${join(dirname(file.path), 'MEMORY.md')}\` on demand.`);
+  }
   if (file.truncated) {
     lines.push('', `WARNING: file is ${formatKb(file.originalBytes)}. Only the first ${formatKb(Buffer.byteLength(file.content, 'utf8'))} was loaded. Read the file directly if more detail is needed.`);
   }

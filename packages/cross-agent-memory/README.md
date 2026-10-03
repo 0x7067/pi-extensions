@@ -12,9 +12,11 @@ Maintained in [`fractaal/pi-extensions`](https://github.com/fractaal/pi-extensio
 - Codex project memory, if present:
   - `~/.codex/projects/<project-slug>/memory/MEMORY.md`
   - `~/.Codex/projects/<project-slug>/memory/MEMORY.md`
-- Codex global memory, if present:
-  - `~/.codex/memories/MEMORY.md`
-  - `~/.Codex/memories/MEMORY.md`
+- Codex global summary, if present:
+  - `~/.codex/memories/memory_summary.md`
+  - `~/.Codex/memories/memory_summary.md`
+
+Codex's `memory_summary.md` is its compact, prompt-loaded index. Its global `MEMORY.md` is the detailed handbook, not a startup index. The extension injects the summary and a pointer to the handbook for on-demand reads. If the summary is missing or empty, it does not fall back to injecting the handbook. Neither Codex file nor its automatic memory generation is modified.
 
 It also considers the git common worktree root, so a task worktree can still pick up memory saved against the main checkout root.
 
