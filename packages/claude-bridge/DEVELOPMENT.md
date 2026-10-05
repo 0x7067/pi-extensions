@@ -17,7 +17,7 @@ Implementation details for contributors. End-user setup, settings, and troublesh
 
 - Pi's tools reach Claude Code through one in-process MCP server whose `tools/list` returns each tool's JSON Schema unchanged. Claude Code sends an MCP tool's input schema to the API as listed, so unions and references survive; the earlier Zod conversion for `createSdkMcpServer` did not.
 - The only Claude Code built-in kept is ToolSearch. Claude Code defers every MCP tool not marked `_meta["anthropic/alwaysLoad"]`, and `tools: []` would remove ToolSearch and with it all deferral.
-- Pi's own tools are marked always-load. Tools Pi bridges from other MCP servers (`mcp__<server>__<tool>`) are deferred until Claude has called them in the session: Claude Code rebuilds its loaded set only from its own `tool_reference` results, which a copy rebuilt from Pi history does not contain.
+- Pi's own tools are marked always-load; tools Pi bridges from other MCP servers (`mcp__<server>__<tool>`) are deferred. Loading one appends it to the request, so the prompt cache survives. Claude Code tracks loaded tools only through its own `tool_reference` results, which a copy rebuilt from Pi history does not contain, so after a rebuild Claude searches again for a tool it needs. The API accepts history that calls a tool not loaded in the current request (checked against the live API on 2026-10-06).
 - Claude Code runs ToolSearch itself. The bridge does not emit it to Pi, so Pi's turn continues into Claude's next request.
 
 ## Claude session copy

@@ -1293,10 +1293,9 @@ function resolveMcpTools(context: Context, excludeToolName?: string): {
 
 // Tools Pi itself provides always load. Tools Pi bridges from other MCP servers
 // (`mcp__<server>__<tool>`) wait behind Claude Code's ToolSearch, as Claude Code
-// treats its own built-ins and MCP tools, until Claude has called them in this
-// session: a session rebuilt from Pi history keeps no record of what it loaded.
-function isDeferredTool(name: string, usedToolNames: ReadonlySet<string>): boolean {
-	return name.startsWith("mcp__") && !usedToolNames.has(name);
+// treats its own built-ins and MCP tools.
+function isDeferredTool(name: string): boolean {
+	return name.startsWith("mcp__");
 }
 
 // Creates an MCP server that bridges pi tools to the SDK. Each tool call
@@ -1307,7 +1306,7 @@ function isDeferredTool(name: string, usedToolNames: ReadonlySet<string>): boole
 // operates on the correct query's state even across pushContext/popContext calls.
 // Pi tool parameters are JSON Schema and are served unchanged; converting them
 // through Zod for createSdkMcpServer loses unions and references.
-function buildMcpServers(tools: Tool[], usedToolNames: ReadonlySet<string>, queryCtx: QueryContext): Record<string, McpSdkServerConfigWithInstance> | undefined {
+function buildMcpServers(tools: Tool[], queryCtx: QueryContext): Record<string, McpSdkServerConfigWithInstance> | undefined {
 	if (!tools.length) return undefined;
 	const callTool = async (toolName: string, args?: Record<string, unknown>): Promise<McpResult> => {
 		const mappedArgs = mapToolArgs(toolName, args);
@@ -1351,7 +1350,7 @@ function buildMcpServers(tools: Tool[], usedToolNames: ReadonlySet<string>, quer
 			name: tool.name,
 			description: tool.description,
 			inputSchema: tool.parameters as McpTool["inputSchema"],
-			...(isDeferredTool(tool.name, usedToolNames) ? {} : { _meta: { "anthropic/alwaysLoad": true } }),
+			...(isDeferredTool(tool.name) ? {} : { _meta: { "anthropic/alwaysLoad": true } }),
 		})),
 	}));
 	server.server.setRequestHandler(CallToolRequestSchema, (request) => callTool(request.params.name, request.params.arguments));
@@ -2038,9 +2037,7 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 
 	const { mcpTools, customToolNameToSdk, customToolNameToPi } = resolveMcpTools(context);
 
-	const usedToolNames = new Set(context.messages.flatMap((message) =>
-		message.role === "assistant" ? message.content.flatMap((block) => block.type === "toolCall" ? [block.name] : []) : []));
-	const mcpServers = buildMcpServers(mcpTools, usedToolNames, ctx());
+	const mcpServers = buildMcpServers(mcpTools, ctx());
 	const bridgeConfig = loadBridgeConfig(cwd);
 	const providerSettings = bridgeConfig.provider ?? {};
 	const systemPromptMode = providerSettings.systemPromptMode ?? "claude-code";

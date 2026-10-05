@@ -300,16 +300,19 @@ describe("Claude Code contract", { timeout: 60_000, skip: claudeBinary ? false :
 		assert.equal(textOf(reply), "Grant removed.");
 	});
 
-	it("a bridged tool Claude already called stays loaded when its session is rebuilt from Pi history", async () => {
+	it("after a session is rebuilt from Pi history, Claude can search for a bridged tool it used before and call it again", async () => {
 		const bridge = newBridge(TOOL_SEARCH);
 		const start = fakeApi.requests.length;
-		respond = () => ({ text: "ok" });
-		const call = assistantToolCall("mcp__aria__apply_change", { change: { operation: "delete_grant", grant_id: "g1" } });
+		respond = (_request, index) => {
+			if (index === start) return { toolUse: { id: "toolu_search_2", name: "ToolSearch", input: { query: `select:${APPLY_SDK_NAME}`, max_results: 1 } } };
+			if (index === start + 1) return { toolUse: { id: "toolu_apply_2", name: APPLY_SDK_NAME, input: { change: { operation: "delete_grant", grant_id: "g2" } } } };
+			return { text: "ok" };
+		};
+		const earlier = assistantToolCall("mcp__aria__apply_change", { change: { operation: "delete_grant", grant_id: "g1" } });
 
-		await bridge.call(HAIKU, [user("Remove grant g1."), call, toolResult(call.content[0], "removed"), user("And g2?")], { tools: [LOOKUP_TOOL, APPLY_TOOL] });
+		const toolTurn = await bridge.call(HAIKU, [user("Remove grant g1."), earlier, toolResult(earlier.content[0], "removed"), user("And g2?")], { tools: [LOOKUP_TOOL, APPLY_TOOL] });
 
-		const upfront = fakeApi.requests[start].body.tools.filter((tool) => !tool.defer_loading).map((tool) => tool.name);
-		assert.ok(upfront.includes(APPLY_SDK_NAME));
+		assert.deepEqual(toolCallsOf(toolTurn).map((call) => call.arguments), [{ change: { operation: "delete_grant", grant_id: "g2" } }]);
 	});
 
 	it("without tool search, every tool loads upfront with its schema unchanged", async () => {
