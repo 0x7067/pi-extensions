@@ -3,8 +3,9 @@ import assert from "node:assert/strict";
 import { CLAUDE_BRIDGE_TOOL_ISOLATION, DISALLOWED_BUILTIN_TOOLS } from "../src/index.ts";
 
 describe("Claude Code tool isolation", () => {
-	it("disables the Claude Code built-in base tool set", () => {
-		assert.deepEqual(CLAUDE_BRIDGE_TOOL_ISOLATION.tools, []);
+	it("keeps only Claude Code's tool search from the built-in base tool set", () => {
+		assert.deepEqual(CLAUDE_BRIDGE_TOOL_ISOLATION.tools, ["ToolSearch"]);
+		assert.equal(DISALLOWED_BUILTIN_TOOLS.includes("ToolSearch"), false);
 		assert.deepEqual(CLAUDE_BRIDGE_TOOL_ISOLATION.allowedTools, ["mcp__custom-tools__*"]);
 	});
 

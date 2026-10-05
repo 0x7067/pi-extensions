@@ -33,6 +33,25 @@ const claudeBinary = bundledClaudeBinary();
 const HAIKU = { id: "claude-haiku-4-5", name: "Claude Haiku 4.5", api: "claude-bridge", provider: "claude-bridge", contextWindow: 200_000, maxTokens: 64_000, reasoning: false, input: ["text", "image"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
 const LOOKUP_TOOL = { name: "lookup", description: "Look something up.", parameters: { type: "object", properties: { topic: { type: "string" } }, required: ["topic"] } };
 const LOOKUP_SDK_NAME = "mcp__custom-tools__lookup";
+// A tool Pi bridges from another MCP server, with a schema Zod could not round-trip.
+const APPLY_TOOL = {
+	name: "mcp__aria__apply_change",
+	description: "Apply one change.",
+	parameters: {
+		type: "object",
+		properties: {
+			change: {
+				anyOf: [
+					{ type: "object", properties: { operation: { type: "string", const: "delete_grant" }, grant_id: { type: "string" } }, required: ["operation", "grant_id"] },
+					{ type: "object", properties: { operation: { type: "string", const: "merge_identity" }, kept_id: { type: "string" } }, required: ["operation", "kept_id"] },
+				],
+			},
+		},
+		required: ["change"],
+	},
+};
+const APPLY_SDK_NAME = "mcp__custom-tools__mcp__aria__apply_change";
+const TOOL_SEARCH = { ENABLE_TOOL_SEARCH: "true" }; // the fake endpoint is not first-party
 
 const user = (text) => ({ role: "user", content: [{ type: "text", text }], timestamp: Date.now() });
 const ONE_PIXEL_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
@@ -41,6 +60,10 @@ const assistantReply = (text) => ({
 	role: "assistant", provider: "claude-bridge", api: "claude-bridge", model: HAIKU.id, stopReason: "stop", timestamp: Date.now(),
 	usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
 	content: [{ type: "text", text }],
+});
+const assistantToolCall = (name, args) => ({
+	...assistantReply(""), stopReason: "toolUse",
+	content: [{ type: "toolCall", id: `toolu_${name}_${Date.now()}`, name, arguments: args }],
 });
 const toolResult = (toolCall, text) => ({ role: "toolResult", toolCallId: toolCall.id, toolName: toolCall.name, content: [{ type: "text", text }], isError: false, timestamp: Date.now() });
 const toolCallsOf = (message) => message.content.filter((block) => block.type === "toolCall");
@@ -68,9 +91,9 @@ function newBridge(env) {
 		cwd,
 		notifications,
 		/** One provider call, as Pi's agent loop makes it. Resolves with the final assistant message. */
-		async call(model, messages, { signal, onEvent } = {}) {
+		async call(model, messages, { signal, onEvent, tools = [LOOKUP_TOOL] } = {}) {
 			// Pi passes no cwd to providers; the session cwd comes from session_start.
-			const stream = provider.streamSimple(model, { systemPrompt: "You are a test assistant.", messages, tools: [LOOKUP_TOOL] }, { signal });
+			const stream = provider.streamSimple(model, { systemPrompt: "You are a test assistant.", messages, tools }, { signal });
 			let last;
 			for await (const event of stream) {
 				last = event;
@@ -219,9 +242,9 @@ describe("Claude Code contract", { timeout: 60_000, skip: claudeBinary ? false :
 		const bridge = newBridge();
 		const start = fakeApi.requests.length;
 		respond = (_request, index) => {
-			// A tool input that fails the tool schema never reaches Pi's handler, so
+			// A call to a tool the bridge does not serve never reaches Pi's handler, so
 			// Claude Code carries on by itself; its next request then fails.
-			if (index === start) return { toolUse: { id: "toolu_invalid_1", name: LOOKUP_SDK_NAME, input: { topic: 5 } } };
+			if (index === start) return { toolUse: { id: "toolu_unserved_1", name: "mcp__custom-tools__unserved", input: {} } };
 			if (index === start + 1) return { status: 400, message: "invalid_request_error: upstream rejected the request" };
 			return { text: "Continuing after the lookup." };
 		};
@@ -239,6 +262,66 @@ describe("Claude Code contract", { timeout: 60_000, skip: claudeBinary ? false :
 
 		assert.equal(textOf(reply), "Continuing after the lookup.");
 		assert.equal(hasFakeReply(fakeApi.requests.at(-1)), false);
+	});
+
+	it("with tool search, Pi's own tools load upfront and tools bridged from MCP servers wait to be searched", async () => {
+		const bridge = newBridge(TOOL_SEARCH);
+		const start = fakeApi.requests.length;
+		respond = () => ({ text: "ok" });
+
+		await bridge.call(HAIKU, [user("hi")], { tools: [LOOKUP_TOOL, APPLY_TOOL] });
+
+		const upfront = fakeApi.requests[start].body.tools.filter((tool) => !tool.defer_loading).map((tool) => tool.name);
+		assert.ok(upfront.includes("ToolSearch"));
+		assert.ok(upfront.includes(LOOKUP_SDK_NAME), "Pi's own tools must never need a search");
+		assert.equal(upfront.includes(APPLY_SDK_NAME), false);
+	});
+
+	it("Claude can search for a bridged tool and call it in the same turn; Pi sees only that call", async () => {
+		const bridge = newBridge(TOOL_SEARCH);
+		const start = fakeApi.requests.length;
+		respond = (_request, index) => {
+			if (index === start) return { toolUse: { id: "toolu_search_1", name: "ToolSearch", input: { query: `select:${APPLY_SDK_NAME}`, max_results: 1 } } };
+			if (index === start + 1) return { toolUse: { id: "toolu_apply_1", name: APPLY_SDK_NAME, input: { change: { operation: "delete_grant", grant_id: "g1" } } } };
+			return { text: "Grant removed." };
+		};
+
+		const history = [user("Remove grant g1.")];
+		const toolTurn = await bridge.call(HAIKU, history, { tools: [LOOKUP_TOOL, APPLY_TOOL] });
+		const toolCalls = toolCallsOf(toolTurn);
+		assert.deepEqual(toolCalls.map((call) => call.name), ["mcp__aria__apply_change"]);
+		assert.deepEqual(toolCalls[0].arguments, { change: { operation: "delete_grant", grant_id: "g1" } });
+
+		const loaded = fakeApi.requests[start + 1].body.tools.find((tool) => tool.name === APPLY_SDK_NAME);
+		assert.deepEqual(loaded.input_schema, APPLY_TOOL.parameters, "the API must receive the tool's schema unchanged");
+
+		history.push(toolTurn, toolResult(toolCalls[0], "removed"));
+		const reply = await bridge.call(HAIKU, history, { tools: [LOOKUP_TOOL, APPLY_TOOL] });
+		assert.equal(textOf(reply), "Grant removed.");
+	});
+
+	it("a bridged tool Claude already called stays loaded when its session is rebuilt from Pi history", async () => {
+		const bridge = newBridge(TOOL_SEARCH);
+		const start = fakeApi.requests.length;
+		respond = () => ({ text: "ok" });
+		const call = assistantToolCall("mcp__aria__apply_change", { change: { operation: "delete_grant", grant_id: "g1" } });
+
+		await bridge.call(HAIKU, [user("Remove grant g1."), call, toolResult(call.content[0], "removed"), user("And g2?")], { tools: [LOOKUP_TOOL, APPLY_TOOL] });
+
+		const upfront = fakeApi.requests[start].body.tools.filter((tool) => !tool.defer_loading).map((tool) => tool.name);
+		assert.ok(upfront.includes(APPLY_SDK_NAME));
+	});
+
+	it("without tool search, every tool loads upfront with its schema unchanged", async () => {
+		const bridge = newBridge();
+		const start = fakeApi.requests.length;
+		respond = () => ({ text: "ok" });
+
+		await bridge.call(HAIKU, [user("hi")], { tools: [LOOKUP_TOOL, APPLY_TOOL] });
+
+		const tools = fakeApi.requests[start].body.tools;
+		assert.equal(tools.some((tool) => tool.name === "ToolSearch" || tool.defer_loading), false);
+		assert.deepEqual(tools.find((tool) => tool.name === APPLY_SDK_NAME).input_schema, APPLY_TOOL.parameters);
 	});
 
 	it("Claude Code runs in the Pi session's working directory, not the host process's", async () => {
