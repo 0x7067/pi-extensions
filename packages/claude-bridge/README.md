@@ -18,6 +18,7 @@ Maintained from [`@vanillagreen/pi-claude-bridge`](https://github.com/vanillagre
 - Thinking-level forwarding with summarized Opus thinking display.
 - Optional Claude effort overrides (`xhigh` → `max` for Opus 4.8).
 - MCP isolation and Claude cloud-MCP suppression to keep tokens lean.
+- Tools Pi bridges from MCP servers (`mcp__<server>__<tool>`) wait behind Claude Code's tool search until Claude needs them; Pi's own tools always load. Claude Code turns tool search on by itself only for a first-party Anthropic endpoint, so a host routing Claude through a proxy enables it with `ENABLE_TOOL_SEARCH=true` in `env` when the proxy forwards Anthropic requests unchanged.
 - Opt-in forwarding of `APPEND_SYSTEM.md` and recognized Pi prompt hooks.
 
 ## Install

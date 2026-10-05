@@ -2,8 +2,10 @@ import { calculateCost, type AssistantMessage, type AssistantMessageEventStream,
 import * as piAi from "@earendil-works/pi-ai";
 import { transformMessages } from "@earendil-works/pi-ai/api/transform-messages";
 import { type ExtensionAPI, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
-import { createSdkMcpServer, query, type EffortLevel, type SDKMessage, type SDKUserMessage, type SettingSource, type SpawnOptions, type SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
+import { query, type EffortLevel, type McpSdkServerConfigWithInstance, type SDKMessage, type SDKUserMessage, type SettingSource, type SpawnOptions, type SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam, MessageParam } from "@anthropic-ai/sdk/resources";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { CallToolRequestSchema, ListToolsRequestSchema, type Tool as McpTool } from "@modelcontextprotocol/sdk/types.js";
 import { createSession, deleteSession, openSession, repairToolPairing } from "cc-session-io";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn as spawnProcess } from "child_process";
@@ -26,7 +28,6 @@ import { findUnpairedToolUses, summarizeMissingToolNames, type MissingToolResult
 import { loadConfig, normalizeEffortLevel, recordProjectTrust, type Config } from "./config.js";
 import { extractAgentsAppend } from "./agents-md.js";
 import { buildPromptContextAppend } from "./prompt-context.js";
-import { jsonSchemaToZodShape } from "./typebox-to-zod.js";
 import { resolveGetModels } from "./pi-ai-compat.js";
 
 // Compat (#2): use factory if available (pi-ai ≥0.66), else fall back to constructor (gsd-pi etc.)
@@ -445,12 +446,16 @@ const SDK_TO_PI_TOOL_NAME: Record<string, string> = {
 const MODELS = buildModels(getModels("anthropic"));
 
 // Disable Claude Code built-ins in the provider path. Pi owns tool execution;
-// Claude reaches Pi tools through the bridged MCP server instead.
+// Claude reaches Pi tools through the bridged MCP server instead. The one
+// built-in kept is ToolSearch: Claude Code runs it itself to load deferred MCP
+// tools on demand (see buildMcpServers), so Pi never executes it.
 //
 // `allowedTools` is a permission auto-allow list in the Claude Agent SDK, not a
-// visibility allowlist. Use `tools: []` to remove the built-in tool set, and keep
-// this disallow list as a belt-and-suspenders guard for SDK/CLI built-ins that may
+// visibility allowlist. `tools` names the built-in tool set to keep, and this
+// disallow list is a belt-and-suspenders guard for SDK/CLI built-ins that may
 // otherwise leak into the model context (e.g. TodoWrite, CronList, SendMessage).
+const CLAUDE_CODE_TOOL_SEARCH = "ToolSearch";
+
 export const DISALLOWED_BUILTIN_TOOLS = [
 	"Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "Bash", "Agent", "Task",
 	"NotebookEdit", "EnterWorktree", "ExitWorktree",
@@ -460,11 +465,11 @@ export const DISALLOWED_BUILTIN_TOOLS = [
 	"ListMcpResources", "ReadMcpResource",
 	"WebFetch", "WebSearch",
 	"AskUserQuestion", "EnterPlanMode", "ExitPlanMode",
-	"ToolSearch", "ScheduleWakeup",
+	"ScheduleWakeup",
 ];
 
 export const CLAUDE_BRIDGE_TOOL_ISOLATION = {
-	tools: [] as string[],
+	tools: [CLAUDE_CODE_TOOL_SEARCH],
 	disallowedTools: DISALLOWED_BUILTIN_TOOLS,
 	allowedTools: [`mcp__${MCP_SERVER_NAME}__*`],
 } satisfies Pick<NonNullable<Parameters<typeof query>[0]["options"]>, "tools" | "allowedTools" | "disallowedTools">;
@@ -1286,57 +1291,70 @@ function resolveMcpTools(context: Context, excludeToolName?: string): {
 	return { mcpTools, customToolNameToSdk, customToolNameToPi };
 }
 
-// Creates an MCP server that bridges pi tools to the SDK. Each tool handler
+// Tools Pi itself provides always load. Tools Pi bridges from other MCP servers
+// (`mcp__<server>__<tool>`) wait behind Claude Code's ToolSearch, as Claude Code
+// treats its own built-ins and MCP tools.
+function isDeferredTool(name: string): boolean {
+	return name.startsWith("mcp__");
+}
+
+// Creates an MCP server that bridges pi tools to the SDK. Each tool call
 // blocks on a Promise until pi delivers the tool result via streamSimple.
-// Handlers claim their tool_call id by matching the actual MCP call
+// Calls claim their tool_call id by matching the actual MCP call
 // (tool name + arguments) against the recorded tool_use blocks, then results
-// are matched by ID. Handlers close over the captured `queryCtx`, ensuring they
-// operate on the correct query's state even across pushContext/popContext calls.
-function buildMcpServers(tools: Tool[], queryCtx: QueryContext): Record<string, ReturnType<typeof createSdkMcpServer>> | undefined {
+// are matched by ID. The handler closes over the captured `queryCtx`, ensuring it
+// operates on the correct query's state even across pushContext/popContext calls.
+// Pi tool parameters are JSON Schema and are served unchanged; converting them
+// through Zod for createSdkMcpServer loses unions and references.
+function buildMcpServers(tools: Tool[], queryCtx: QueryContext): Record<string, McpSdkServerConfigWithInstance> | undefined {
 	if (!tools.length) return undefined;
-	const mcpTools = tools.map((tool) => ({
-		name: tool.name,
-		description: tool.description,
-		inputSchema: jsonSchemaToZodShape(tool.parameters),
-		handler: async (args?: Record<string, unknown>) => {
-			const mappedArgs = mapToolArgs(tool.name, args);
-			const claim = queryCtx.claimToolCall(tool.name, mappedArgs);
-			const toolCallId = claim.toolCallId;
-			if (!toolCallId) {
-				debug(`WARNING: mcp handler ${tool.name} has no toolCallId (available=${claim.available})`);
-				diagDump("tool_handler_unmatched", {
-					toolName: tool.name,
-					argKeys: argKeys(mappedArgs),
-					available: claim.available,
-					turnToolCallIds: queryCtx.turnToolCallIds,
-					turnToolCalls: safeToolCallSummary(queryCtx.turnToolCalls),
-				});
-				return { content: [{ type: "text", text: `Claude bridge internal error: no matching tool_call id for ${tool.name}` }], isError: true } satisfies McpResult;
-			}
-			if (claim.match !== "tool-args" || claim.ambiguous) {
-				debug(`mcp handler: ${tool.name} [${toolCallId}] claimed by ${claim.match}${claim.ambiguous ? " (ambiguous)" : ""}`);
-			}
-			if (toolCallId && queryCtx.pendingResults.has(toolCallId)) {
-				const result = queryCtx.pendingResults.get(toolCallId)!;
-				queryCtx.pendingResults.delete(toolCallId);
-				queryCtx.markToolResultResolved(toolCallId);
-				debug(`mcp handler: ${tool.name} [${toolCallId}] → resolved from queue (${queryCtx.pendingResults.size} remaining)`);
-				return result;
-			}
-			debug(`mcp handler: ${tool.name} [${toolCallId}] → waiting`);
-			return new Promise<McpResult>((resolve) => {
-				queryCtx.pendingToolCalls.set(toolCallId, {
-					toolName: tool.name,
-					resolve: (result) => {
-						queryCtx.markToolResultResolved(toolCallId);
-						resolve(result);
-					},
-				});
+	const callTool = async (toolName: string, args?: Record<string, unknown>): Promise<McpResult> => {
+		const mappedArgs = mapToolArgs(toolName, args);
+		const claim = queryCtx.claimToolCall(toolName, mappedArgs);
+		const toolCallId = claim.toolCallId;
+		if (!toolCallId) {
+			debug(`WARNING: mcp handler ${toolName} has no toolCallId (available=${claim.available})`);
+			diagDump("tool_handler_unmatched", {
+				toolName,
+				argKeys: argKeys(mappedArgs),
+				available: claim.available,
+				turnToolCallIds: queryCtx.turnToolCallIds,
+				turnToolCalls: safeToolCallSummary(queryCtx.turnToolCalls),
 			});
-		},
+			return { content: [{ type: "text", text: `Claude bridge internal error: no matching tool_call id for ${toolName}` }], isError: true } satisfies McpResult;
+		}
+		if (claim.match !== "tool-args" || claim.ambiguous) {
+			debug(`mcp handler: ${toolName} [${toolCallId}] claimed by ${claim.match}${claim.ambiguous ? " (ambiguous)" : ""}`);
+		}
+		if (toolCallId && queryCtx.pendingResults.has(toolCallId)) {
+			const result = queryCtx.pendingResults.get(toolCallId)!;
+			queryCtx.pendingResults.delete(toolCallId);
+			queryCtx.markToolResultResolved(toolCallId);
+			debug(`mcp handler: ${toolName} [${toolCallId}] → resolved from queue (${queryCtx.pendingResults.size} remaining)`);
+			return result;
+		}
+		debug(`mcp handler: ${toolName} [${toolCallId}] → waiting`);
+		return new Promise<McpResult>((resolve) => {
+			queryCtx.pendingToolCalls.set(toolCallId, {
+				toolName,
+				resolve: (result) => {
+					queryCtx.markToolResultResolved(toolCallId);
+					resolve(result);
+				},
+			});
+		});
+	};
+	const server = new McpServer({ name: MCP_SERVER_NAME, version: "1.0.0" }, { capabilities: { tools: {} } });
+	server.server.setRequestHandler(ListToolsRequestSchema, () => ({
+		tools: tools.map((tool) => ({
+			name: tool.name,
+			description: tool.description,
+			inputSchema: tool.parameters as McpTool["inputSchema"],
+			...(isDeferredTool(tool.name) ? {} : { _meta: { "anthropic/alwaysLoad": true } }),
+		})),
 	}));
-	const server = createSdkMcpServer({ name: MCP_SERVER_NAME, version: "1.0.0", tools: mcpTools });
-	return { [MCP_SERVER_NAME]: server };
+	server.server.setRequestHandler(CallToolRequestSchema, (request) => callTool(request.params.name, request.params.arguments));
+	return { [MCP_SERVER_NAME]: { type: "sdk", name: MCP_SERVER_NAME, instance: server } };
 }
 
 // --- Usage helpers ---
@@ -1494,6 +1512,10 @@ export function processStreamEvent(
 		} else if (event.content_block?.type === "thinking") {
 			c.turnBlocks.push({ type: "thinking", thinking: "", thinkingSignature: "", index: event.index });
 			c.currentPiStream!.push({ type: "thinking_start", contentIndex: c.turnBlocks.length - 1, partial: c.turnOutput });
+		} else if (event.content_block?.type === "tool_use" && event.content_block.name === CLAUDE_CODE_TOOL_SEARCH) {
+			// Claude Code runs its own tool search and continues the turn with the
+			// loaded tool; Pi neither sees nor executes it. Its deltas then go unmatched.
+			return;
 		} else if (event.content_block?.type === "tool_use") {
 			c.turnSawToolCall = true;
 			const mappedName = mapToolName(event.content_block.name, customToolNameToPi);
@@ -1604,7 +1626,7 @@ function appendMissingToolUsesFromAssistant(
 	if (!assistantMsg?.content) return false;
 	let sawToolUse = false;
 	for (const block of assistantMsg.content) {
-		if (block.type !== "tool_use") continue;
+		if (block.type !== "tool_use" || block.name === CLAUDE_CODE_TOOL_SEARCH) continue;
 		const existingIdx = c.turnBlocks.findIndex((b: any) => b.type === "toolCall" && b.id === block.id);
 		const name = mapToolName(block.name, customToolNameToPi);
 		const mappedArgs = mapToolArgs(name, block.input);
@@ -1689,7 +1711,7 @@ export function processAssistantMessage(message: SDKMessage, model: Model<any>, 
 			c.currentPiStream?.push({ type: "thinking_start", contentIndex: idx, partial: c.turnOutput });
 			if (block.thinking) c.currentPiStream?.push({ type: "thinking_delta", contentIndex: idx, delta: block.thinking, partial: c.turnOutput });
 			c.currentPiStream?.push({ type: "thinking_end", contentIndex: idx, content: block.thinking ?? "", partial: c.turnOutput });
-		} else if (block.type === "tool_use") {
+		} else if (block.type === "tool_use" && block.name !== CLAUDE_CODE_TOOL_SEARCH) {
 			ensureTurnStarted();
 			c.turnSawToolCall = true;
 			const mappedName = mapToolName(block.name, customToolNameToPi);
