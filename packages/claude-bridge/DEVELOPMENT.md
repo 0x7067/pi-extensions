@@ -13,6 +13,13 @@ Implementation details for contributors. End-user setup, settings, and troublesh
 - The query is released before Pi is told a turn ended, on every path (completion, Stop, stream-idle timeout, Claude errors). Pi can call again at once (Stop flushes queued messages); that call must start a fresh query.
 - A call with an already-aborted signal is Pi following up a stopped turn; the bridge returns `aborted` without starting Claude Code.
 
+## Tools Claude sees
+
+- Pi's tools reach Claude Code through one in-process MCP server whose `tools/list` returns each tool's JSON Schema unchanged. Claude Code sends an MCP tool's input schema to the API as listed, so unions and references survive; the earlier Zod conversion for `createSdkMcpServer` did not.
+- The only Claude Code built-in kept is ToolSearch. Claude Code defers every MCP tool not marked `_meta["anthropic/alwaysLoad"]`, and `tools: []` would remove ToolSearch and with it all deferral.
+- Pi's own tools are marked always-load. Tools Pi bridges from other MCP servers (`mcp__<server>__<tool>`) are deferred until Claude has called them in the session: Claude Code rebuilds its loaded set only from its own `tool_reference` results, which a copy rebuilt from Pi history does not contain.
+- Claude Code runs ToolSearch itself. The bridge does not emit it to Pi, so Pi's turn continues into Claude's next request.
+
 ## Claude session copy
 
 - Claude Code runs in the Pi session's working directory, recorded at `session_start`. Pi passes no cwd to providers, and the host process's cwd (for Symphony Desktop, its launch directory) would otherwise become Claude Code's working directory and git context.
