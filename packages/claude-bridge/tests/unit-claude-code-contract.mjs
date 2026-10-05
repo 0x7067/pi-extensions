@@ -306,13 +306,18 @@ describe("Claude Code contract", { timeout: 60_000, skip: claudeBinary ? false :
 		respond = (_request, index) => {
 			if (index === start) return { toolUse: { id: "toolu_search_2", name: "ToolSearch", input: { query: `select:${APPLY_SDK_NAME}`, max_results: 1 } } };
 			if (index === start + 1) return { toolUse: { id: "toolu_apply_2", name: APPLY_SDK_NAME, input: { change: { operation: "delete_grant", grant_id: "g2" } } } };
-			return { text: "ok" };
+			return { text: "Grant g2 removed." };
 		};
 		const earlier = assistantToolCall("mcp__aria__apply_change", { change: { operation: "delete_grant", grant_id: "g1" } });
+		const history = [user("Remove grant g1."), earlier, toolResult(earlier.content[0], "removed"), user("And g2?")];
 
-		const toolTurn = await bridge.call(HAIKU, [user("Remove grant g1."), earlier, toolResult(earlier.content[0], "removed"), user("And g2?")], { tools: [LOOKUP_TOOL, APPLY_TOOL] });
+		const toolTurn = await bridge.call(HAIKU, history, { tools: [LOOKUP_TOOL, APPLY_TOOL] });
+		const toolCalls = toolCallsOf(toolTurn);
+		assert.deepEqual(toolCalls.map((call) => call.arguments), [{ change: { operation: "delete_grant", grant_id: "g2" } }]);
 
-		assert.deepEqual(toolCallsOf(toolTurn).map((call) => call.arguments), [{ change: { operation: "delete_grant", grant_id: "g2" } }]);
+		history.push(toolTurn, toolResult(toolCalls[0], "removed"));
+		const reply = await bridge.call(HAIKU, history, { tools: [LOOKUP_TOOL, APPLY_TOOL] });
+		assert.equal(textOf(reply), "Grant g2 removed.");
 	});
 
 	it("without tool search, every tool loads upfront with its schema unchanged", async () => {
