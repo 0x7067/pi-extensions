@@ -117,6 +117,9 @@ export class QueryContext {
 	turnStarted = false;
 	turnSawStreamEvent = false;
 	turnSawToolCall = false;
+	// The API message whose stream events are arriving: message_start seen,
+	// message_stop not yet.
+	streamingMessageId: string | null = null;
 
 	get turnBlocks(): Array<any> {
 		if (!this.turnOutput) throw new Error("turnBlocks accessed before resetTurnState");
@@ -128,6 +131,7 @@ export class QueryContext {
 		this.turnStarted = false;
 		this.turnSawStreamEvent = false;
 		this.turnSawToolCall = false;
+		this.streamingMessageId = null;
 		this.handledTerminalError = false;
 		// Tool-call tracking is NOT reset here — it persists across the
 		// tool-result delivery callback for the same assistant message. New

@@ -6,7 +6,9 @@
  *   { text }                       stream an assistant text reply
  *   { thinking }                   stream a reply that is only a thinking block
  *   { toolUse: { id, name, input } } stream a single tool call
+ *   { toolUses: [{ id, name, input }, ...] } stream several tool calls in one message
  *   { status, message }            return an API error
+ * A streamed reply may add `outputTokens`, the count the message reports when it ends.
  */
 import { createServer } from "node:http";
 
@@ -21,29 +23,30 @@ let nextMessageId = 1;
 function streamReply(res, model, reply) {
 	const id = `msg_fake_${nextMessageId++}`;
 	const usage = { input_tokens: 100, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 };
+	const finalUsage = { output_tokens: reply.outputTokens ?? 10 };
 	const events = [{ type: "message_start", message: { id, type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage } }];
-	if (reply.toolUse) {
-		const { id: toolId, name, input } = reply.toolUse;
-		events.push(
-			{ type: "content_block_start", index: 0, content_block: { type: "tool_use", id: toolId, name, input: {} } },
-			{ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: JSON.stringify(input ?? {}) } },
-			{ type: "content_block_stop", index: 0 },
-			{ type: "message_delta", delta: { stop_reason: "tool_use", stop_sequence: null }, usage: { output_tokens: 10 } },
-		);
+	const toolUses = reply.toolUses ?? (reply.toolUse ? [reply.toolUse] : null);
+	if (toolUses) {
+		toolUses.forEach(({ id: toolId, name, input }, index) => events.push(
+			{ type: "content_block_start", index, content_block: { type: "tool_use", id: toolId, name, input: {} } },
+			{ type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: JSON.stringify(input ?? {}) } },
+			{ type: "content_block_stop", index },
+		));
+		events.push({ type: "message_delta", delta: { stop_reason: "tool_use", stop_sequence: null }, usage: finalUsage });
 	} else if (reply.thinking) {
 		events.push(
 			{ type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "", signature: "" } },
 			{ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: reply.thinking } },
 			{ type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "fake-signature" } },
 			{ type: "content_block_stop", index: 0 },
-			{ type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 10 } },
+			{ type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: finalUsage },
 		);
 	} else {
 		events.push(
 			{ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
 			{ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: reply.text ?? "" } },
 			{ type: "content_block_stop", index: 0 },
-			{ type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 10 } },
+			{ type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: finalUsage },
 		);
 	}
 	events.push({ type: "message_stop" });
