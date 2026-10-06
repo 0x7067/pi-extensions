@@ -129,35 +129,34 @@ export function createClaudeModelCatalog(options: {
   });
   return {
     refresh(context: RefreshModelsContext): Promise<BridgeCatalogModel[]> {
+      // Pi now hands over the stored catalog synchronously, so this body can finish
+      // before the assignment below; clear `pending` from the promise itself.
       pending ??= (async () => {
-        try {
-          const stored = await context.store.read();
-          const cached = parseClaudeModelMetadata(stored?.models ?? []);
-          models = [...new Map([...options.initialModels, ...cached].map(model => [model.id, model])).values()];
-          if (!context.allowNetwork || context.signal?.aborted) return models;
-          if (!context.force && stored?.checkedAt && Date.now() - stored.checkedAt < 4 * 60 * 60_000) return models;
-          const signal = AbortSignal.any([AbortSignal.timeout(20_000), ...(context.signal ? [context.signal] : [])]);
-          const [discovered, metadataResult] = await Promise.all([
-            options.discover(signal),
-            fetchMetadata(signal).then(parseClaudeModelMetadata).catch((error: unknown) => {
-              options.warn?.(error instanceof Error ? error.message : 'Claude model metadata is unavailable.');
-              return [];
-            }),
-          ]);
-          signal.throwIfAborted();
-          const merged = mergeClaudeModelDiscovery(models, discovered, metadataResult);
-          if (merged.missingMetadata.length) {
-            options.warn?.(`Claude models await context/output metadata: ${merged.missingMetadata.join(', ')}.`);
-          }
-          const entry = {
-            models: merged.models.map(model => ({ ...model, provider: PROVIDER_ID, api: PROVIDER_ID, baseUrl: PROVIDER_ID })) as Model<typeof PROVIDER_ID>[],
-            checkedAt: Date.now(),
-          };
-          await context.store.write(entry);
-          models = merged.models;
-          return models;
-        } finally { pending = undefined; }
-      })();
+        const stored = context.stored;
+        const cached = parseClaudeModelMetadata(stored?.models ?? []);
+        models = [...new Map([...options.initialModels, ...cached].map(model => [model.id, model])).values()];
+        if (!context.allowNetwork || context.signal?.aborted) return models;
+        if (!context.force && stored?.checkedAt && Date.now() - stored.checkedAt < 4 * 60 * 60_000) return models;
+        const signal = AbortSignal.any([AbortSignal.timeout(20_000), ...(context.signal ? [context.signal] : [])]);
+        const [discovered, metadataResult] = await Promise.all([
+          options.discover(signal),
+          fetchMetadata(signal).then(parseClaudeModelMetadata).catch((error: unknown) => {
+            options.warn?.(error instanceof Error ? error.message : 'Claude model metadata is unavailable.');
+            return [];
+          }),
+        ]);
+        signal.throwIfAborted();
+        const merged = mergeClaudeModelDiscovery(models, discovered, metadataResult);
+        if (merged.missingMetadata.length) {
+          options.warn?.(`Claude models await context/output metadata: ${merged.missingMetadata.join(', ')}.`);
+        }
+        const entry = {
+          models: merged.models.map(model => ({ ...model, provider: PROVIDER_ID, api: PROVIDER_ID, baseUrl: PROVIDER_ID })) as Model<typeof PROVIDER_ID>[],
+          checkedAt: Date.now(),
+        };
+        await context.publish({ persist: entry, update: () => { models = merged.models; } });
+        return models;
+      })().finally(() => { pending = undefined; });
       return pending;
     },
   };

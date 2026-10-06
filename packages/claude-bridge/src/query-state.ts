@@ -111,6 +111,10 @@ export class QueryContext {
 	unmatchedToolResultIds = new Set<string>();
 	reportedToolResultMismatch = false;
 	handledTerminalError = false;
+	// Pi tool names offered to Claude behind ToolSearch (not declared to Pi's model).
+	deferredToolNames = new Set<string>();
+	// Calls to such tools that made Pi activate them mid-turn.
+	lateActivatedToolCallIds = new Set<string>();
 
 	// Per-turn (reset together)
 	turnOutput: AssistantMessage | null = null;

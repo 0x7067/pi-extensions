@@ -1,7 +1,7 @@
-import { calculateCost, type AssistantMessage, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions, type Tool } from "@earendil-works/pi-ai";
+import { calculateCost, getCurrentSystemPrompt, getCurrentTools, type AssistantMessage, type AssistantMessageEventStream, type Context, type Model, type SimpleStreamOptions, type Tool, type ToolCall } from "@earendil-works/pi-ai";
 import * as piAi from "@earendil-works/pi-ai";
 import { transformMessages } from "@earendil-works/pi-ai/api/transform-messages";
-import { type ExtensionAPI, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, type ExtensionUIContext, type ToolInfo } from "@earendil-works/pi-coding-agent";
 import { query, type EffortLevel, type McpSdkServerConfigWithInstance, type SDKMessage, type SDKUserMessage, type SettingSource, type SpawnOptions, type SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam, MessageParam } from "@anthropic-ai/sdk/resources";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -850,9 +850,17 @@ function fingerprintMessages(messages: Context["messages"]): string {
 	return createHash("sha256").update(JSON.stringify(normalized)).digest("hex");
 }
 
+// Messages that count toward cursors and fingerprints. System messages hold prompt
+// and tool-loadout changes; they are not part of the conversation Claude continues.
+export function conversationMessages(messages: Context["messages"]): Context["messages"] {
+	return messages.filter((message) => message.role !== "system");
+}
+
 function readBuiltSessionContext(sessionManager: unknown): { messages: Context["messages"] } | undefined {
-	const built = typeof (sessionManager as any)?.buildSessionContext === "function" ? (sessionManager as any).buildSessionContext() : undefined;
-	return Array.isArray(built?.messages) ? built as { messages: Context["messages"] } : undefined;
+	// ReadonlySessionManager exposes buildSessionProjection; older runtimes only have buildSessionContext.
+	const build = (sessionManager as any)?.buildSessionProjection ?? (sessionManager as any)?.buildSessionContext;
+	const built = typeof build === "function" ? build.call(sessionManager) : undefined;
+	return Array.isArray(built?.messages) ? { messages: conversationMessages(built.messages) } : undefined;
 }
 
 function latestPersistedBridgeSession(sessionManager: unknown): PersistedBridgeSessionState | undefined {
@@ -1004,10 +1012,10 @@ function convertAndImportMessages(
 // Pi doesn't pass tool results directly — it appends them to the context and calls
 // the provider again. Thin wrapper over extract-tool-results.js that adds per-turn
 // debug logging at the extraction boundary.
-function extractAllToolResults(context: Context): McpResult[] {
-	const { results, stopIdx } = _extractAllToolResults(context.messages as unknown as Array<{ role: string; [key: string]: unknown }>);
-	debug(`extractAllToolResults: ${results.length} results from ${context.messages.length} msgs, stopped at index ${stopIdx}`);
-	debug(`extractAllToolResults: all msg roles:`, context.messages.map((m, i) => `[${i}]${m.role}`).join(" "));
+function extractAllToolResults(messages: Context["messages"]): McpResult[] {
+	const { results, stopIdx } = _extractAllToolResults(messages as unknown as Array<{ role: string; [key: string]: unknown }>);
+	debug(`extractAllToolResults: ${results.length} results from ${messages.length} msgs, stopped at index ${stopIdx}`);
+	debug(`extractAllToolResults: all msg roles:`, messages.map((m, i) => `[${i}]${m.role}`).join(" "));
 	for (let r = 0; r < results.length; r++) {
 		debug(`extractAllToolResults: result[${r}] id=${results[r].toolCallId}${results[r].isError ? " ERROR" : ""} preview:`, JSON.stringify(results[r].content).slice(0, 150));
 	}
@@ -1262,40 +1270,77 @@ export function mapToolArgs(
 
 // --- Provider helpers: tool bridge ---
 
+// What Claude reads in place of Pi's "Tool X not found" for the first call of a tool
+// that Pi activated because of that call.
+function lateActivationResult(toolName: string | undefined): McpResult {
+	return {
+		content: [{ type: "text", text: `Tool ${toolName ?? "(unknown)"} was just loaded into Pi, which could not run it in this turn. Call it again now with the same arguments.` }],
+		isError: true,
+	};
+}
+
+
+// Pi executes a tool call from the tool set it fixed when the turn began, and
+// declares tools to its model only once they are active. Claude loads a deferred
+// tool through ToolSearch inside a turn, so the call reaches Pi too late for that
+// turn's execution: Pi reports the tool as not found. Activating the tool here
+// records it in Pi's transcript (a `toolsAdded` message before Pi's next request,
+// so it survives model switches) and makes it runnable from the next turn on.
+function activateDeferredTool(toolCallId: string | undefined, toolName: string): void {
+	const c = ctx();
+	const pi = bridgeRuntime().extensionApi;
+	if (!toolCallId || !pi || !c.deferredToolNames.has(toolName)) return;
+	const active = pi.getActiveTools();
+	if (active.includes(toolName)) return;
+	pi.setActiveTools([...active, toolName]);
+	if (pi.getActiveTools().includes(toolName)) c.lateActivatedToolCallIds.add(toolCallId);
+	debug(`activateDeferredTool: ${toolName} [${toolCallId}] activated=${c.lateActivatedToolCallIds.has(toolCallId)}`);
+}
+
+
 // --- Query state ---
 // QueryContext + context stack live in query-state.js so tests can import
 // them without activating the extension. `ctx()`, `pushContext()`, `popContext()`
 // are imported at the top of this file.
 
-function resolveMcpTools(context: Context, excludeToolName?: string): {
-	mcpTools: Tool[];
+// A Pi tool offered to Claude. `deferred` tools are not declared to Pi's model, so
+// Claude Code keeps them behind its ToolSearch instead of loading them up front.
+export type BridgeTool = Tool & { deferred?: boolean };
+
+// Pi's own search mechanisms; Claude Code's ToolSearch replaces them.
+const PI_SEARCH_TOOL_NAMES = new Set(["tool_search", "codemode"]);
+
+type RegisteredTool = Pick<ToolInfo, "name" | "description" | "parameters" | "exposure">;
+
+// Every tool Pi declares to its model loads up front. Registered tools with
+// `deferred` or `codemode` exposure that Pi has not declared are offered without
+// alwaysLoad, so Claude Code defers them and ToolSearch finds them. `hidden`
+// tools and Pi's own search tools stay out.
+export function resolveMcpTools(messages: Context["messages"], registered: readonly RegisteredTool[] = []): {
+	mcpTools: BridgeTool[];
 	customToolNameToSdk: Map<string, string>;
 	customToolNameToPi: Map<string, string>;
 } {
-	const mcpTools: Tool[] = [];
+	const mcpTools: BridgeTool[] = [];
 	const customToolNameToSdk = new Map<string, string>();
 	const customToolNameToPi = new Map<string, string>();
-
-	if (!context.tools) return { mcpTools, customToolNameToSdk, customToolNameToPi };
-
-	for (const tool of context.tools) {
-		if (tool.name === excludeToolName) continue;
+	const add = (tool: BridgeTool) => {
+		if (PI_SEARCH_TOOL_NAMES.has(tool.name) || customToolNameToSdk.has(tool.name)) return;
 		const sdkName = `${MCP_TOOL_PREFIX}${tool.name}`;
 		mcpTools.push(tool);
 		customToolNameToSdk.set(tool.name, sdkName);
 		customToolNameToSdk.set(tool.name.toLowerCase(), sdkName);
 		customToolNameToPi.set(sdkName, tool.name);
 		customToolNameToPi.set(sdkName.toLowerCase(), tool.name);
+	};
+
+	for (const tool of getCurrentTools(messages)) add(tool);
+	for (const tool of registered) {
+		if (tool.exposure !== "deferred" && tool.exposure !== "codemode") continue;
+		add({ name: tool.name, description: tool.description, parameters: tool.parameters, deferred: true });
 	}
 
 	return { mcpTools, customToolNameToSdk, customToolNameToPi };
-}
-
-// Tools Pi itself provides always load. Tools Pi bridges from other MCP servers
-// (`mcp__<server>__<tool>`) wait behind Claude Code's ToolSearch, as Claude Code
-// treats its own built-ins and MCP tools.
-function isDeferredTool(name: string): boolean {
-	return name.startsWith("mcp__");
 }
 
 // Creates an MCP server that bridges pi tools to the SDK. Each tool call
@@ -1306,7 +1351,7 @@ function isDeferredTool(name: string): boolean {
 // operates on the correct query's state even across pushContext/popContext calls.
 // Pi tool parameters are JSON Schema and are served unchanged; converting them
 // through Zod for createSdkMcpServer loses unions and references.
-function buildMcpServers(tools: Tool[], queryCtx: QueryContext): Record<string, McpSdkServerConfigWithInstance> | undefined {
+function buildMcpServers(tools: BridgeTool[], queryCtx: QueryContext): Record<string, McpSdkServerConfigWithInstance> | undefined {
 	if (!tools.length) return undefined;
 	const callTool = async (toolName: string, args?: Record<string, unknown>): Promise<McpResult> => {
 		const mappedArgs = mapToolArgs(toolName, args);
@@ -1350,7 +1395,7 @@ function buildMcpServers(tools: Tool[], queryCtx: QueryContext): Record<string, 
 			name: tool.name,
 			description: tool.description,
 			inputSchema: tool.parameters as McpTool["inputSchema"],
-			...(isDeferredTool(tool.name) ? {} : { _meta: { "anthropic/alwaysLoad": true } }),
+			...(tool.deferred ? {} : { _meta: { "anthropic/alwaysLoad": true } }),
 		})),
 	}));
 	server.server.setRequestHandler(CallToolRequestSchema, (request) => callTool(request.params.name, request.params.arguments));
@@ -1444,7 +1489,7 @@ export function flushUnemittedToolCalls(): boolean {
 
 	ensureTurnStarted();
 	for (const call of calls) {
-		const block = { type: "toolCall" as const, id: call.id, name: call.toolName, arguments: call.arguments };
+		const block = { type: "toolCall" as const, id: call.id, name: call.toolName, arguments: call.arguments as ToolCall["arguments"] };
 		c.turnBlocks.push(block);
 		const contentIndex = c.turnBlocks.length - 1;
 		c.currentPiStream.push({ type: "toolcall_start", contentIndex, partial: c.turnOutput });
@@ -1523,6 +1568,7 @@ export function processStreamEvent(
 			c.turnSawToolCall = true;
 			const mappedName = mapToolName(event.content_block.name, customToolNameToPi);
 			c.recordToolCall(event.content_block.id, mappedName, {});
+			activateDeferredTool(event.content_block.id, mappedName);
 			c.turnBlocks.push({
 				type: "toolCall", id: event.content_block.id,
 				name: mappedName,
@@ -1634,6 +1680,7 @@ function appendMissingToolUsesFromAssistant(
 		const name = mapToolName(block.name, customToolNameToPi);
 		const mappedArgs = mapToolArgs(name, block.input);
 		c.recordToolCall(block.id, name, mappedArgs);
+		activateDeferredTool(block.id, name);
 		if (c.emittedToolCallIds.has(block.id)) continue;
 		sawToolUse = true;
 		if (existingIdx >= 0) {
@@ -1722,6 +1769,7 @@ export function processAssistantMessage(message: SDKMessage, model: Model<any>, 
 			const mappedName = mapToolName(block.name, customToolNameToPi);
 			const mappedArgs = mapToolArgs(mappedName, block.input);
 			c.recordToolCall(block.id, mappedName, mappedArgs);
+			activateDeferredTool(block.id, mappedName);
 			c.turnBlocks.push({
 				type: "toolCall", id: block.id,
 				name: mappedName,
@@ -1907,7 +1955,11 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 	const run: RunInBridgeRuntime = callback => runWithBridgeRuntime(runtime, callback);
 	const stream = newAssistantMessageEventStream();
 
-	const lastMsgRole = context.messages[context.messages.length - 1]?.role;
+	// Pi 1.x carries the prompt and tool declarations as system messages inside the
+	// transcript, and a prompt override can collapse them. Cursors, fingerprints and
+	// the Claude copy count conversation messages only, so they stay stable.
+	const messages = conversationMessages(context.messages);
+	const lastMsgRole = messages[messages.length - 1]?.role;
 	const cwd = (options as { cwd?: string } | undefined)?.cwd ?? bridgeRuntime().sessionCwd ?? process.cwd();
 	debug(`provider: streamClaudeAgentSdk called, activeQuery=${!!ctx().activeQuery}, lastMsgRole=${lastMsgRole}, signalAborted=${options?.signal?.aborted === true}`);
 
@@ -1952,7 +2004,7 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 		// on the next macrotask so the messages reach Claude Code ahead of the
 		// results. If one misses the round, Claude Code runs it as a follow-up turn
 		// in this query.
-		const steering = newUserMessages(context.messages, queryCtx.latestCursor);
+		const steering = newUserMessages(messages, queryCtx.latestCursor);
 		let steeringDelivered = true;
 		for (const message of steering) {
 			if (!queryCtx.input?.push(message)) steeringDelivered = false;
@@ -1962,10 +2014,10 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 			? (resolve: () => void) => { setImmediate(resolve); }
 			: (resolve: () => void) => { resolve(); };
 
-		const allResults = extractAllToolResults(context);
-		debug(`provider: tool results, ${allResults.length} results, ${queryCtx.pendingToolCalls.size} waiting handlers, ctx.msgs=${context.messages.length}`);
+		const allResults = extractAllToolResults(messages);
+		debug(`provider: tool results, ${allResults.length} results, ${queryCtx.pendingToolCalls.size} waiting handlers, ctx.msgs=${messages.length}`);
 		const unmatchedResultIds: string[] = [];
-		for (const result of allResults) {
+		for (let result of allResults) {
 			const id = result.toolCallId;
 			if (id && !queryCtx.hasRecordedToolCall(id)) {
 				queryCtx.markToolResultUnmatched(id);
@@ -1974,6 +2026,9 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 				continue;
 			}
 			queryCtx.markToolResultDelivered(id);
+			if (id && result.isError && queryCtx.lateActivatedToolCallIds.has(id)) {
+				result = { ...lateActivationResult(queryCtx.turnToolCalls.find((call) => call.id === id)?.toolName), toolCallId: id };
+			}
 			if (id && queryCtx.pendingToolCalls.has(id)) {
 				const pending = queryCtx.pendingToolCalls.get(id)!;
 				queryCtx.pendingToolCalls.delete(id);
@@ -2017,10 +2072,10 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 			// A steering message that could not be pushed is only in Pi's history;
 			// rebuild the copy from it before the next turn.
 			bridgeRuntime().sharedSession = steeringDelivered
-				? { ...bridgeRuntime().sharedSession, cursor: context.messages.length }
+				? { ...bridgeRuntime().sharedSession, cursor: messages.length }
 				: { ...bridgeRuntime().sharedSession, needsRebuild: true };
 		}
-		queryCtx.latestCursor = Math.max(queryCtx.latestCursor, context.messages.length);
+		queryCtx.latestCursor = Math.max(queryCtx.latestCursor, messages.length);
 		return stream;
 	}
 
@@ -2039,9 +2094,12 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 	ctx().resetTurnState(model);
 	ctx().resetToolTracking();
 	ctx().reportedToolResultMismatch = false;
-	ctx().latestCursor = context.messages.length;
+	ctx().latestCursor = messages.length;
 
-	const { mcpTools, customToolNameToSdk, customToolNameToPi } = resolveMcpTools(context);
+	const piApi = bridgeRuntime().extensionApi;
+	const { mcpTools, customToolNameToSdk, customToolNameToPi } = resolveMcpTools(context.messages, piApi?.getAllTools?.() ?? []);
+	ctx().deferredToolNames = new Set(mcpTools.filter((tool) => tool.deferred).map((tool) => tool.name));
+	const piSystemPrompt = getCurrentSystemPrompt(context.messages);
 
 	const mcpServers = buildMcpServers(mcpTools, ctx());
 	const bridgeConfig = loadBridgeConfig(cwd);
@@ -2049,9 +2107,9 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 	const systemPromptMode = providerSettings.systemPromptMode ?? "claude-code";
 	const appendSystemPrompt = systemPromptMode === "claude-code" && providerSettings.appendSystemPrompt !== false;
 	const agentsAppend = appendSystemPrompt ? extractAgentsAppend() : undefined;
-	const skillsAppend = appendSystemPrompt ? extractSkillsBlock(context.systemPrompt) : undefined;
+	const skillsAppend = appendSystemPrompt ? extractSkillsBlock(piSystemPrompt) : undefined;
 	const promptContextAppend = systemPromptMode === "claude-code"
-		? buildPromptContextAppend(context.systemPrompt, cwd, bridgeConfig.promptContext ?? {}, bridgeRuntime().userDir)
+		? buildPromptContextAppend(piSystemPrompt, cwd, bridgeConfig.promptContext ?? {}, bridgeRuntime().userDir)
 		: { text: undefined, labels: [] };
 	const appendParts = [agentsAppend, skillsAppend, promptContextAppend.text].filter((part): part is string => Boolean(part));
 	const systemPromptAppend = appendParts.length > 0 ? appendParts.join("\n\n") : undefined;
@@ -2069,7 +2127,7 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 	const env = claudeEnvironment();
 	const claudeExecutable = resolveClaudeCodeExecutable({ configuredPath: providerSettings.pathToClaudeCodeExecutable, env })?.executablePath;
 	const claudeExecutablePreflight = claudeExecutable ? preflightClaudeExecutable(claudeExecutable, cwd) : undefined;
-	const { sessionId: resumeSessionId, rescue } = syncSharedSession(context.messages, cwd, model, customToolNameToSdk);
+	const { sessionId: resumeSessionId, rescue } = syncSharedSession(messages, cwd, model, customToolNameToSdk);
 
 	// 3. Prompt. The input stays open for the whole turn so steering can be
 	//    pushed into it. In a rescue the copy already ends on the unanswered
@@ -2077,16 +2135,16 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 	const input = new PromptInput();
 	let promptPreview = "(rescue: answer the unanswered end of the copy)";
 	if (!rescue) {
-		const lastMsg = context.messages[context.messages.length - 1];
+		const lastMsg = messages[messages.length - 1];
 		let content = lastMsg ? userMessageToPromptContent(lastMsg) : "";
 		if (content.length === 0) {
 			// Guard: the last context message should be a non-empty user message here.
 			diagDump("empty_prompt", {
-				contextLength: context.messages.length,
+				contextLength: messages.length,
 				lastMsgRole: lastMsg?.role,
 				isReentrant,
 				stackDepth: stackDepth(),
-				messageRoles: context.messages.map((m, i) => `[${i}]${m.role}`).join(" "),
+				messageRoles: messages.map((m, i) => `[${i}]${m.role}`).join(" "),
 			});
 			// Recover: use a continuation prompt so the SDK doesn't send an empty text block
 			content = "[continue]";
@@ -2138,7 +2196,7 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 		...(fallbackModel ? { fallbackModel } : {}),
 		...(providerSettings.fastMode ? { settings: { fastMode: true } } : {}),
 		systemPrompt: systemPromptMode === "pi"
-			? context.systemPrompt ?? ""
+			? piSystemPrompt
 			: {
 				type: "preset", preset: "claude_code",
 				append: systemPromptAppend ? systemPromptAppend : undefined,
@@ -2154,7 +2212,7 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 	};
 
 	debug("provider: fresh query",
-		`model=${queryOptions.model} msgs=${context.messages.length} tools=${mcpTools.length}`,
+		`model=${queryOptions.model} msgs=${messages.length} tools=${mcpTools.length}`,
 		`resume=${resumeSessionId?.slice(0, 8) ?? "none"} rescue=${rescue} effort=${effort ?? "default"}`,
 		`fallback=${fallbackModel ?? "none"}`,
 		`systemPrompt=${systemPromptMode} appendSys=${appendSystemPrompt} promptCtx=${promptContextAppend.labels.join(",") || "none"} strictMcp=${strictMcpConfigEnabled} fastMode=${providerSettings.fastMode === true}`,
@@ -2296,7 +2354,7 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 			const previousSession = bridgeRuntime().sharedSession;
 			const sessionId = capturedSessionId ?? previousSession?.sessionId;
 			if (sessionId) {
-				const cursor = Math.max(context.messages.length, abortCtx.latestCursor, previousSession?.cursor ?? 0);
+				const cursor = Math.max(messages.length, abortCtx.latestCursor, previousSession?.cursor ?? 0);
 				debug(`provider: query done, session=${sessionId.slice(0, 8)}, cursor=${cursor}`);
 				// Keep a rebuild marked during the turn (e.g. a steering message that
 				// could not be pushed exists only in Pi's history).
