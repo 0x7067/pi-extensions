@@ -32,25 +32,6 @@ const textDeltas = (events) => events.filter((event) => event.type === "text_del
 describe("assistant tool-use boundary", () => {
 	beforeEach(() => resetStack());
 
-	it("ends a streamed tool-use turn when the SDK assistant message arrives before message_stop", () => {
-		ctx().resetTurnState(model);
-		const events = installFakeStream();
-		const names = new Map([["mcp__custom-tools__bash", "bash"]]);
-
-		processStreamEvent(streamEvent({ type: "message_start", message: { id: "msg-1" } }), names, model);
-		processStreamEvent(streamEvent({ type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_1", name: "mcp__custom-tools__bash", input: {} } }), names, model);
-		processStreamEvent(streamEvent({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: "{\"command\":\"echo hi\"}" } }), names, model);
-		processAssistantMessage({
-			type: "assistant",
-			message: { id: "msg-1", content: [{ type: "tool_use", id: "toolu_1", name: "mcp__custom-tools__bash", input: { command: "echo hi" } }] },
-		}, model, names);
-
-		assert.deepEqual(events.slice(-2).map((event) => event.type), ["done", "stream_end"]);
-		const message = doneMessage(events);
-		assert.equal(message.stopReason, "toolUse");
-		assert.deepEqual(message.content, [{ type: "toolCall", id: "toolu_1", name: "bash", arguments: { command: "echo hi" } }]);
-	});
-
 	it("adds tool calls that only appear in the assistant message before ending the turn", () => {
 		ctx().resetTurnState(model);
 		const events = installFakeStream();

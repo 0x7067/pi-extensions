@@ -1419,8 +1419,9 @@ function parsePartialJson(input: string, fallback: Record<string, unknown>): Rec
 // Push-based streaming with MCP tool bridge:
 // 1. streamSimple starts a query() and kicks off consumeQuery() in background
 // 2. consumeQuery() iterates the SDK generator, pushing events to currentPiStream
-// 3. On tool_use: ends the current pi stream, nulls it out. The MCP handler
-//    blocks the generator naturally — no events arrive until resolved.
+// 3. When a tool-use message ends (message_stop, after message_delta's final
+//    usage): ends the current pi stream, nulls it out. Claude Code waits on the
+//    MCP handlers, so no events of the next API call arrive until they resolve.
 // 4. Pi executes the tool, calls streamSimple again. We swap in the new stream,
 //    resolve the MCP handler, and the generator unblocks — events flow to new stream.
 //
@@ -1487,6 +1488,7 @@ export function processStreamEvent(
 	if (!c.currentPiStream || !c.turnOutput) return;
 	const event = (message as SDKMessage & { event: any }).event;
 	if (event?.type === "ping") return;
+	if (event?.type === "message_stop") c.streamingMessageId = null;
 	if (event?.type === "message_stop" && !c.turnSawToolCall) {
 		debug("processStreamEvent: ignoring bare message_stop with no streamed content/tool call");
 		return;
@@ -1497,6 +1499,7 @@ export function processStreamEvent(
 			c.resetToolTracking();
 			c.assistantMessageId = event.message?.id ?? null;
 		}
+		c.streamingMessageId = event.message?.id ?? null;
 		updateTurnOutputModel(event.message?.model);
 		if (event.message?.usage) updateUsage(c.turnOutput, event.message.usage, model);
 		return;
@@ -1592,10 +1595,10 @@ export function processStreamEvent(
 	}
 
 	if (event?.type === "message_stop" && c.turnSawToolCall) {
-		// Tool call complete — end this pi stream. The SDK will still yield an
-		// assistant message for this turn, but currentPiStream=null causes
-		// consumeQuery to skip it. The MCP handler blocks the generator until
-		// pi delivers the tool result via the next streamSimple call.
+		// Tool-use message complete, with its final usage from message_delta —
+		// end this pi stream. Claude Code may already have called the tools' MCP
+		// handlers; they wait until pi delivers the results via the next
+		// streamSimple call.
 		c.turnOutput.stopReason = "toolUse";
 		c.currentPiStream!.push({ type: "done", reason: "toolUse", message: c.turnOutput });
 		c.currentPiStream!.end();
@@ -1675,14 +1678,16 @@ export function processAssistantMessage(message: SDKMessage, model: Model<any>, 
 	const assistantMessageId = typeof assistantMsg.id === "string" ? assistantMsg.id : null;
 	if (c.reportedToolResultMismatch) return;
 	if (c.turnSawStreamEvent || (assistantMessageId !== null && assistantMessageId === c.assistantMessageId)) {
-		// Claude Agent SDK can yield the completed assistant message before (or
-		// instead of) a stream_event message_stop for a tool-use turn. Treat that
-		// assistant message as a hard turn boundary so Pi executes the tool calls
-		// and the MCP handlers stay blocked until real tool results are delivered.
-		// Without this fallback, Claude Code can continue internally with empty MCP
-		// results and Pi only sees the real outputs one render cycle later.
+		// Claude Code yields each content block of a streamed message as an
+		// assistant message when the block ends, carrying the usage from
+		// message_start. The message's real output count arrives afterwards in
+		// message_delta, so a message still streaming ends the turn at its
+		// message_stop. An assistant message outside the stream in progress is a
+		// hard turn boundary, so Pi executes the tool calls and the MCP handlers
+		// stay blocked until real tool results are delivered.
 		if (appendMissingToolUsesFromAssistant(assistantMsg, model, customToolNameToPi)) {
 			c.turnSawToolCall = true;
+			if (assistantMessageId !== null && assistantMessageId === c.streamingMessageId) return;
 			if (c.currentPiStream && c.turnOutput) {
 				c.turnOutput.stopReason = "toolUse";
 				c.currentPiStream.push({ type: "done", reason: "toolUse", message: c.turnOutput });
@@ -1787,10 +1792,11 @@ function failTurnWithClaudeError(errorText: string, cwd: string, bridgeConfig: C
 }
 
 /** Background consumer: iterates the SDK generator, pushing events to currentPiStream.
- *  Runs until the query ends. Per turn, the SDK yields stream_events (deltas), then
- *  an assistant message (completed blocks). On tool_use, the stream is ended by
- *  whichever path handles it first (processStreamEvent or processAssistantMessage),
- *  and the MCP handler blocks the generator until pi delivers the tool result.
+ *  Runs until the query ends. Per content block, the SDK yields stream_events
+ *  (deltas) and an assistant message (the completed block). A streamed tool-use
+ *  message ends the pi stream at its message_stop (processStreamEvent); an
+ *  assistant message outside the stream in progress ends it at once
+ *  (processAssistantMessage). The MCP handlers wait until pi delivers the results.
  *  The prompt input is closed once Claude Code reports the turn finished with no
  *  queued user messages left, so the process exits and the loop ends. */
 async function consumeQuery(

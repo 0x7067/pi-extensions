@@ -153,6 +153,50 @@ describe("Claude Code contract", { timeout: 60_000, skip: claudeBinary ? false :
 		assert.equal(requests.some(hasFakeReply), false);
 	});
 
+	it("each turn reaches Pi with the output tokens Claude generated for it, including a tool-call turn", async () => {
+		const bridge = newBridge();
+		const start = fakeApi.requests.length;
+		respond = (_request, index) => index === start
+			? { toolUse: { id: "toolu_usage_1", name: LOOKUP_SDK_NAME, input: { topic: "sky" } }, outputTokens: 1333 }
+			: { text: "The sky is blue.", outputTokens: 7 };
+
+		const history = [user("Look up the colour of the sky.")];
+		const toolTurn = await bridge.call(HAIKU, history);
+		assert.equal(toolTurn.stopReason, "toolUse");
+		assert.equal(toolTurn.usage.output, 1333);
+
+		history.push(toolTurn, toolResult(toolCallsOf(toolTurn)[0], "blue"));
+		const reply = await bridge.call(HAIKU, history);
+		assert.equal(reply.usage.output, 7);
+	});
+
+	it("tool calls Claude makes together reach Pi as one turn with that message's output tokens, and Claude receives every result", async () => {
+		const bridge = newBridge();
+		const start = fakeApi.requests.length;
+		respond = (_request, index) => index === start
+			? { toolUses: [
+				{ id: "toolu_pair_1", name: LOOKUP_SDK_NAME, input: { topic: "sky" } },
+				{ id: "toolu_pair_2", name: LOOKUP_SDK_NAME, input: { topic: "sea" } },
+			], outputTokens: 2400 }
+			: { text: "Both are blue." };
+
+		const history = [user("Look up the sky and the sea.")];
+		const toolTurn = await bridge.call(HAIKU, history);
+		const toolCalls = toolCallsOf(toolTurn);
+		assert.deepEqual(toolCalls.map((call) => call.arguments.topic), ["sky", "sea"]);
+		assert.equal(toolTurn.usage.output, 2400);
+
+		history.push(toolTurn, ...toolCalls.map((call) => toolResult(call, `${call.arguments.topic} is blue`)));
+		const reply = await bridge.call(HAIKU, history);
+
+		assert.equal(textOf(reply), "Both are blue.");
+		const results = fakeApi.requests.at(-1).messages.at(-1).parts.filter((part) => part.startsWith("tool_result:"));
+		assert.equal(results.length, 2);
+		for (const expected of ["tool_result:sky is blue", "tool_result:sea is blue"]) {
+			assert.ok(results.some((part) => part.startsWith(expected)), expected);
+		}
+	});
+
 	it("after Stop, the flushed message reaches Claude without a fake reply and the stopped tool is shown as aborted", async () => {
 		const bridge = newBridge();
 		const start = fakeApi.requests.length;
