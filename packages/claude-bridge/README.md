@@ -23,7 +23,7 @@ Maintained from [`@vanillagreen/pi-claude-bridge`](https://github.com/vanillagre
 
 ## Requirements
 
-Bridge 2.x requires Pi 1.x (`@earendil-works/pi-coding-agent` and `@earendil-works/pi-ai` 1.0 or newer). Use bridge 1.12.x with Pi 0.85 and older.
+Bridge 2.x requires the Pi 1.x provider API as shipped by the fractaal fork 0.86 or newer. It relies on 0.86 resolving a call to a tool activated mid-turn, or registered with `deferred`/`codemode` exposure, in the same turn; upstream Pi 1.0.4 lacks that, so a deferred tool Claude loads would fail its first call there. Use bridge 1.12.x with Pi 0.85 and older.
 
 ## Install
 

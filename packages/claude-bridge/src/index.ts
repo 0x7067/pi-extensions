@@ -1270,22 +1270,9 @@ export function mapToolArgs(
 
 // --- Provider helpers: tool bridge ---
 
-// What Claude reads in place of Pi's "Tool X not found" for the first call of a tool
-// that Pi activated because of that call.
-function lateActivationResult(toolName: string | undefined): McpResult {
-	return {
-		content: [{ type: "text", text: `Tool ${toolName ?? "(unknown)"} was just loaded into Pi, which could not run it in this turn. Call it again now with the same arguments.` }],
-		isError: true,
-	};
-}
-
-
-// Pi executes a tool call from the tool set it fixed when the turn began, and
-// declares tools to its model only once they are active. Claude loads a deferred
-// tool through ToolSearch inside a turn, so the call reaches Pi too late for that
-// turn's execution: Pi reports the tool as not found. Activating the tool here
-// records it in Pi's transcript (a `toolsAdded` message before Pi's next request,
-// so it survives model switches) and makes it runnable from the next turn on.
+// Claude loads a deferred tool through ToolSearch inside a turn. Activating it in Pi
+// records it in the transcript (a `toolsAdded` message before Pi's next request), so
+// it stays declared for later turns and for other models after a model switch.
 function activateDeferredTool(toolCallId: string | undefined, toolName: string): void {
 	const c = ctx();
 	const pi = bridgeRuntime().extensionApi;
@@ -1293,8 +1280,7 @@ function activateDeferredTool(toolCallId: string | undefined, toolName: string):
 	const active = pi.getActiveTools();
 	if (active.includes(toolName)) return;
 	pi.setActiveTools([...active, toolName]);
-	if (pi.getActiveTools().includes(toolName)) c.lateActivatedToolCallIds.add(toolCallId);
-	debug(`activateDeferredTool: ${toolName} [${toolCallId}] activated=${c.lateActivatedToolCallIds.has(toolCallId)}`);
+	debug(`activateDeferredTool: ${toolName} [${toolCallId}]`);
 }
 
 
@@ -2017,7 +2003,7 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 		const allResults = extractAllToolResults(messages);
 		debug(`provider: tool results, ${allResults.length} results, ${queryCtx.pendingToolCalls.size} waiting handlers, ctx.msgs=${messages.length}`);
 		const unmatchedResultIds: string[] = [];
-		for (let result of allResults) {
+		for (const result of allResults) {
 			const id = result.toolCallId;
 			if (id && !queryCtx.hasRecordedToolCall(id)) {
 				queryCtx.markToolResultUnmatched(id);
@@ -2026,9 +2012,6 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 				continue;
 			}
 			queryCtx.markToolResultDelivered(id);
-			if (id && result.isError && queryCtx.lateActivatedToolCallIds.has(id)) {
-				result = { ...lateActivationResult(queryCtx.turnToolCalls.find((call) => call.id === id)?.toolName), toolCallId: id };
-			}
 			if (id && queryCtx.pendingToolCalls.has(id)) {
 				const pending = queryCtx.pendingToolCalls.get(id)!;
 				queryCtx.pendingToolCalls.delete(id);

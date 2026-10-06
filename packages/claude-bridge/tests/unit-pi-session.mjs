@@ -107,24 +107,20 @@ describe("Claude bridge in a Pi session", { timeout: 90_000, skip: claudeBinary 
 		assert.equal(session.getActiveToolNames().includes(DEFERRED_NAME), false, "Pi does not declare a deferred tool to its model");
 		respond = (_request, index) => {
 			if (index === start) return { toolUse: { id: "toolu_load", name: "ToolSearch", input: { query: `select:${DEFERRED_SDK_NAME}`, max_results: 1 } } };
-			if (index === start + 1 || index === start + 2) return { toolUse: { id: `toolu_apply_${index}`, name: DEFERRED_SDK_NAME, input: { change: "g1" } } };
+			if (index === start + 1) return { toolUse: { id: "toolu_apply", name: DEFERRED_SDK_NAME, input: { change: "g1" } } };
 			return { text: "Done." };
 		};
 
 		await session.prompt("Apply change g1.");
 
 		assert.deepEqual(executed, [{ change: "g1" }], "Pi must run the tool exactly once");
-		// Pi fixed its tool set before the call arrived, so the first call is not found; Claude is told to call again.
 		const toolResults = session.messages.filter((message) => message.role === "toolResult");
-		assert.equal(toolResults.length, 2);
-		assert.equal(toolResults[0].isError, true);
-		const toldToRetry = fakeApi.requests[start + 2].messages.at(-1).parts.find((part) => part.startsWith("tool_result:"));
-		assert.match(toldToRetry, /just loaded into Pi.*Call it again/s);
+		assert.equal(toolResults.length, 1, "the first call runs; there is no not-found result to retry");
 		assert.ok(session.getActiveToolNames().includes(DEFERRED_NAME), "the tool is active in Pi");
 		const declared = getCurrentTools(session.messages).map((tool) => tool.name);
 		assert.ok(declared.includes(DEFERRED_NAME), "Pi's transcript declares it, so another model sees it after a model switch");
-		assert.equal(toolResults[1].isError, false);
-		assert.equal(toolResults[1].content[0].text, "applied g1");
+		assert.equal(toolResults[0].isError, false);
+		assert.equal(toolResults[0].content[0].text, "applied g1");
 		const last = session.messages.at(-1);
 		assert.equal(last.role, "assistant");
 		assert.equal(last.content.map((block) => block.text ?? "").join(""), "Done.");

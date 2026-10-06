@@ -104,16 +104,16 @@ function newBridge(env) {
 	let declared; // tool names the transcript declares
 	let initial; // tool names the leading system message declares
 	const systemUpdates = []; // { after, message }: mid-transcript system messages, kept where Pi put them
-	let snapshot = []; // tools the current turn can execute
 	return {
 		cwd,
 		notifications,
 		pi,
 		/** Tool names Pi's transcript declares to the model (what another provider would see). */
 		declaredTools: () => [...(declared ?? [])],
-		/** Pi runs a tool call; a tool that was not active when the turn began is not found. */
+		/** Pi runs a tool call; only an unknown or hidden tool is not found. */
 		runTool(toolCall, text = "ok") {
-			if (!snapshot.includes(toolCall.name)) {
+			const known = registry.get(toolCall.name);
+			if (!known || known.exposure === "hidden") {
 				return { role: "toolResult", toolCallId: toolCall.id, toolName: toolCall.name, content: [{ type: "text", text: `Tool ${toolCall.name} not found` }], isError: true, timestamp: Date.now() };
 			}
 			return toolResult(toolCall, text);
@@ -140,7 +140,6 @@ function newBridge(env) {
 				systemUpdates.push({ after, message: { role: "system", content: "", toolsAdded: added.map(toolOf), timestamp: Date.now() } });
 				declared.push(...added);
 			}
-			snapshot = [...active];
 			const transcript = [{ role: "system", content: systemPrompt, toolsAdded: initial.map(toolOf), timestamp: Date.now() }];
 			messages.forEach((message, index) => {
 				for (const update of systemUpdates) if (update.after === index) transcript.push(update.message);
@@ -479,31 +478,19 @@ describe("Claude Code contract", { timeout: 60_000, skip: claudeBinary ? false :
 		respond = (_request, index) => {
 			if (index === start) return { toolUse: { id: "toolu_load_1", name: "ToolSearch", input: { query: `select:${APPLY_SDK_NAME}`, max_results: 1 } } };
 			if (index === start + 1) return { toolUse: { id: "toolu_apply_a", name: APPLY_SDK_NAME, input } };
-			if (index === start + 2) return { toolUse: { id: "toolu_apply_b", name: APPLY_SDK_NAME, input } };
 			return { text: "Grant removed." };
 		};
 		const history = [user("Remove grant g1.")];
 
-		// Claude's call reaches Pi; Pi's turn was fixed before the tool was active, so it cannot run it yet.
+		// Claude's call reaches Pi, which runs it and records the tool as active.
 		const first = await bridge.call(HAIKU, history, { tools: [LOOKUP_TOOL], registered: [DEFERRED_APPLY] });
 		const [firstCall] = toolCallsOf(first);
 		assert.equal(firstCall.name, APPLY_TOOL.name);
 		assert.ok(bridge.pi.getActiveTools().includes(APPLY_TOOL.name), "the call must activate the tool in Pi");
-		const notRun = bridge.runTool(firstCall);
-		assert.equal(notRun.isError, true);
+		const ran = bridge.runTool(firstCall, "removed");
+		assert.equal(ran.isError, false);
 
-		// Claude is told to call again, and the next Pi turn runs that call.
-		history.push(first, notRun);
-		const second = await bridge.call(HAIKU, history);
-		const toldToRetry = fakeApi.requests.at(-1).messages.at(-1).parts.find((part) => part.startsWith("tool_result:"));
-		assert.match(toldToRetry, /just loaded into Pi.*Call it again/s);
-		assert.doesNotMatch(toldToRetry, /not found/);
-		const [secondCall] = toolCallsOf(second);
-		assert.equal(secondCall.name, APPLY_TOOL.name);
-		const ran = bridge.runTool(secondCall, "removed");
-		assert.equal(ran.isError, false, "Pi runs the call once the tool is active");
-
-		history.push(second, ran);
+		history.push(first, ran);
 		const reply = await bridge.call(HAIKU, history);
 		assert.equal(textOf(reply), "Grant removed.");
 		assert.ok(fakeApi.requests.at(-1).messages.at(-1).parts.some((part) => part.startsWith("tool_result:removed")));
