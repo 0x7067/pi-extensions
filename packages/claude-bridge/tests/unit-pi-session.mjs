@@ -33,6 +33,8 @@ const claudeBinary = bundledClaudeBinary();
 
 const DEFERRED_NAME = "mcp__dev__apply";
 const DEFERRED_SDK_NAME = `mcp__custom-tools__${DEFERRED_NAME}`;
+const CODEMODE_NAME = "mcp__dev__scripted";
+const CODEMODE_SDK_NAME = `mcp__custom-tools__${CODEMODE_NAME}`;
 
 let workDir;
 let fakeApi;
@@ -50,6 +52,20 @@ function devTools(pi) {
 		execute: async (_id, params) => {
 			executed.push(params);
 			return { content: [{ type: "text", text: `applied ${params.change}` }], details: {} };
+		},
+	});
+}
+
+function codemodeTool(pi) {
+	pi.registerTool({
+		name: CODEMODE_NAME,
+		label: "Scripted",
+		description: "A tool reached through codemode.",
+		parameters: Type.Object({ step: Type.String() }),
+		exposure: "codemode",
+		execute: async (_id, params) => {
+			executed.push(params);
+			return { content: [{ type: "text", text: `scripted ${params.step}` }], details: {} };
 		},
 	});
 }
@@ -78,7 +94,7 @@ describe("Claude bridge in a Pi session", { timeout: 90_000, skip: claudeBinary 
 		const resourceLoader = new DefaultResourceLoader({
 			cwd,
 			agentDir,
-			extensionFactories: [createClaudeBridgeExtension({ userDir: agentDir }), devTools],
+			extensionFactories: [createClaudeBridgeExtension({ userDir: agentDir }), devTools, codemodeTool],
 		});
 		await resourceLoader.reload();
 		const modelRuntime = await ModelRuntime.create({ agentDir });
@@ -138,5 +154,23 @@ describe("Claude bridge in a Pi session", { timeout: 90_000, skip: claudeBinary 
 		assert.ok(sent.some((part) => part.includes("Apply change g1.")), "Claude still has the earlier conversation");
 		assert.ok(sent.at(-1).includes("And again?"));
 		assert.equal(fakeApi.requests.length - start, 1);
+	});
+
+	it("a codemode-exposed tool Claude loads and calls also runs in the same turn", async () => {
+		const start = fakeApi.requests.length;
+		const before = executed.length;
+		respond = (_request, index) => {
+			if (index === start) return { toolUse: { id: "toolu_load_cm", name: "ToolSearch", input: { query: `select:${CODEMODE_SDK_NAME}`, max_results: 1 } } };
+			if (index === start + 1) return { toolUse: { id: "toolu_cm", name: CODEMODE_SDK_NAME, input: { step: "one" } } };
+			return { text: "Scripted." };
+		};
+
+		await session.prompt("Run the scripted step.");
+
+		assert.deepEqual(executed.slice(before), [{ step: "one" }]);
+		const result = session.messages.filter((message) => message.role === "toolResult").at(-1);
+		assert.equal(result.isError, false);
+		assert.equal(result.content[0].text, "scripted one");
+		assert.ok(getCurrentTools(session.messages).some((tool) => tool.name === CODEMODE_NAME));
 	});
 });
