@@ -50,8 +50,7 @@ describe("fractal compact extension", () => {
 		installEventBus(apiMock);
 		fractalCompactExtension(apiMock.api);
 
-		const streamSimpleCalls: Array<{ modelId: string }> = [];
-		const requestedProviders: string[] = [];
+		const streamSimpleCalls: Array<{ modelId: string; systemPrompt?: string; userText: string }> = [];
 		const model = { id: "claude-sonnet-5", provider: "claude-bridge", api: "claude-bridge", maxTokens: 64_000, reasoning: false };
 
 		const ctx = {
@@ -61,19 +60,20 @@ describe("fractal compact extension", () => {
 			model,
 			sessionManager: { getSessionFile: () => "/tmp/session.jsonl", getSessionId: () => "session-1" },
 			modelRegistry: {
-				getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "not-used", headers: {} }),
-				getProvider: (provider: string) => {
-					requestedProviders.push(provider);
+				streamSimple: (
+					streamModel: { id: string },
+					context: { systemPrompt?: string; messages: Array<{ content: Array<{ text: string }> }> },
+				) => {
+					streamSimpleCalls.push({
+						modelId: streamModel.id,
+						systemPrompt: context.systemPrompt,
+						userText: context.messages[0]!.content[0]!.text,
+					});
 					return {
-						streamSimple: (streamModel: { id: string }) => {
-							streamSimpleCalls.push({ modelId: streamModel.id });
-							return {
-								result: async () => ({
-									stopReason: "stop",
-									content: [{ type: "text", text: "compacted summary" }],
-								}),
-							};
-						},
+						result: async () => ({
+							stopReason: "stop",
+							content: [{ type: "text", text: "compacted summary" }],
+						}),
 					};
 				},
 			},
@@ -97,8 +97,12 @@ describe("fractal compact extension", () => {
 			ctx,
 		)) as { compaction?: { summary: string } };
 
-		expect(requestedProviders).toEqual(["claude-bridge"]);
-		expect(streamSimpleCalls).toEqual([{ modelId: "claude-sonnet-5" }]);
+		expect(streamSimpleCalls).toHaveLength(1);
+		expect(streamSimpleCalls[0]!.modelId).toBe("claude-sonnet-5");
+		// The system prompt must reach the registry as Context.systemPrompt; the
+		// registry folds it into the transcript the provider receives.
+		expect(streamSimpleCalls[0]!.systemPrompt).toBeTruthy();
+		expect(streamSimpleCalls[0]!.userText).toContain("<conversation>");
 		expect(result.compaction?.summary).toContain("compacted summary");
 	});
 
@@ -119,7 +123,7 @@ describe("fractal compact extension", () => {
 			cwd: '/tmp/example', model: { id: 'native-model', maxTokens: 64000 },
 			ui: { notify: () => undefined, setStatus: () => undefined },
 			sessionManager: { getSessionFile: () => '/tmp/session', getSessionId: () => 'session' },
-			modelRegistry: { getProvider: () => { throw new Error('Tail-only provider path must not run'); } },
+			modelRegistry: { streamSimple: () => { throw new Error('Tail-only provider path must not run'); } },
 		} as unknown as ExtensionContext) as { compaction: { summary: string } };
 		expect(result.compaction.summary).toContain('Prior checkpoint and tail preserved');
 		expect(prompt).toContain('Keep this new constraint');
