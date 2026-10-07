@@ -6,14 +6,6 @@ import {
 	serializeConversation,
 } from "@earendil-works/pi-coding-agent";
 
-/** Fork-only seam: present when Pi holds a native checkpoint that must be summarized with its tail. Upstream's event type omits it. */
-type NativeContextSummarizer = {
-	summarizeNativeContext?: (
-		context: { systemPrompt?: string; messages: Array<{ role: "user"; content: Array<{ type: "text"; text: string }>; timestamp: number }> },
-		options: { maxTokens: number },
-	) => Promise<{ stopReason: string; content: Array<{ type: string; text?: string }> }>;
-};
-
 const FRACTAL_COMPACT_SYSTEM_PROMPT = `You are a context compaction assistant. Your task is to read a conversation between a user and an AI coding assistant, then produce a high-fidelity structured summary for the SAME session to continue after compaction.
 
 Do NOT continue the conversation. Do NOT answer questions from the conversation. Do NOT add preamble. ONLY output the requested numbered summary.`;
@@ -223,7 +215,7 @@ function compactRepeatedGoalContinuations<T extends MaybeTextContentMessage>(mes
 async function generateFractalSummary(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
-	event: SessionBeforeCompactEvent & NativeContextSummarizer,
+	event: SessionBeforeCompactEvent,
 ): Promise<string> {
 	if (!ctx.model) throw new Error("No model selected");
 
