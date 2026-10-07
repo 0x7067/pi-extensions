@@ -3,9 +3,11 @@
  * The checks do not require Claude Code to be installed; they use temp files
  * and the current Node executable as a known platform binary.
  */
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { preflightClaudeExecutable, spawnClaudeCodeWithDiagnostics } from "../src/index.ts";
@@ -121,5 +123,36 @@ describe("preflightClaudeExecutable", () => {
 		assert.notEqual(error.cause, error);
 		assert.doesNotThrow(() => JSON.stringify(error));
 		assert.doesNotMatch(error.stack ?? "", /wrapClaudeSpawnErrorForSdk/);
+	}));
+
+	it("stops Claude Code when the bridge host disappears", async () => withTempDir(async (dir) => {
+		const pidFile = join(dir, "child.pid");
+		const bundle = join(fileURLToPath(new URL("..", import.meta.url)), "bundle", "index.js");
+		const host = spawn(process.execPath, [
+			"--input-type=module",
+			"-e",
+			`const { spawnClaudeCodeWithDiagnostics } = await import(${JSON.stringify(bundle)});\n` +
+				`const { writeFileSync } = await import("node:fs");\n` +
+				`const child = spawnClaudeCodeWithDiagnostics({ command: process.execPath, args: ["-e", ${JSON.stringify(`const { writeFileSync } = require("node:fs"); writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000);`)}], cwd: ${JSON.stringify(dir)}, env: process.env, signal: new AbortController().signal });\n` +
+				`child.once("error", (error) => { writeFileSync(${JSON.stringify(join(dir, "host-error.txt"))}, String(error)); process.exit(1); });\n` +
+				`console.log("ready");\nsetTimeout(() => process.exit(0), 150);`,
+		], { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
+		let output = "";
+		host.stdout.on("data", (chunk) => { output += chunk.toString(); });
+		const closed = new Promise((resolve) => host.once("close", resolve));
+		for (let attempt = 0; attempt < 50 && !existsSync(pidFile); attempt++) await new Promise((resolve) => setTimeout(resolve, 20));
+		assert.equal(output.trim(), "ready");
+		assert.ok(existsSync(pidFile), "the supervised Claude child started");
+		await closed;
+		const childPid = Number(readFileSync(pidFile, "utf8"));
+		let alive = true;
+		for (let attempt = 0; attempt < 60 && alive; attempt++) {
+			try { process.kill(childPid, 0); } catch { alive = false; }
+			if (alive) await new Promise((resolve) => setTimeout(resolve, 50));
+		}
+		if (alive) {
+			try { process.kill(childPid, "SIGKILL"); } catch {}
+		}
+		assert.equal(alive, false, "the Claude child must not survive its bridge host");
 	}));
 });
