@@ -255,19 +255,12 @@ async function generateFractalSummary(
 		return textContent(response.content).trim();
 	}
 
-	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
-	if (!auth.ok) throw new Error(auth.error);
-
-	// Summarize through the registered provider, which is the same route a normal
-	// turn takes. pi-ai's completeSimple resolves the model against pi-ai's api
-	// registry instead, so it only reaches providers backed by a real api module.
-	// Extension-registered providers declare a synthetic api and supply their own
-	// streamSimple, which only the composed provider knows how to route — going
-	// direct threw "No API provider registered for api: <api>" for those models.
-	const provider = ctx.modelRegistry.getProvider(ctx.model.provider);
-	if (!provider) throw new Error(`No provider registered for "${ctx.model.provider}"`);
-
-	const response = await provider
+	// Summarize through the model registry, which is the same route a normal turn
+	// takes: it resolves auth, normalizes the Context (folding the system prompt
+	// into the transcript) and dispatches to the registered provider. Going direct
+	// to pi-ai's completeSimple only reaches providers backed by a real api module,
+	// so extension-registered providers with a synthetic api would fail.
+	const response = await ctx.modelRegistry
 		.streamSimple(
 			ctx.model,
 			{
@@ -275,8 +268,6 @@ async function generateFractalSummary(
 				messages: [{ role: "user", content: [{ type: "text", text: prompt }], timestamp: Date.now() }],
 			},
 			{
-				apiKey: auth.apiKey,
-				headers: auth.headers,
 				maxTokens,
 				signal,
 				reasoning: ctx.model.reasoning ? activeReasoning(pi) : undefined,
