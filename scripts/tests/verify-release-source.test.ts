@@ -62,6 +62,10 @@ describe('release source verification', () => {
     expect(parseReleaseTag('directive-roots-v0.1.1')).toEqual({ workspace: 'directive-roots', version: '0.1.1' });
   });
 
+  it('parses a republish tag as the same package version', () => {
+    expect(parseReleaseTag('directive-roots-v0.1.1-republish')).toEqual({ workspace: 'directive-roots', version: '0.1.1' });
+  });
+
   it('rejects malformed and path-like release tags', () => {
     expect(() => parseReleaseTag('../directive-roots-v0.1.1')).toThrow('Release tag must be');
     expect(() => parseReleaseTag('directive-roots-0.1.1')).toThrow('Release tag must be');
