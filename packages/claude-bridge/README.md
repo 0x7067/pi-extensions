@@ -18,8 +18,12 @@ Maintained from [`@vanillagreen/pi-claude-bridge`](https://github.com/vanillagre
 - Thinking-level forwarding with summarized Opus thinking display.
 - Optional Claude effort overrides (`xhigh` → `max` for Opus 4.8).
 - MCP isolation and Claude cloud-MCP suppression to keep tokens lean.
-- Tools Pi bridges from MCP servers (`mcp__<server>__<tool>`) wait behind Claude Code's tool search until Claude needs them; Pi's own tools always load. Claude Code turns tool search on by itself only for a first-party Anthropic endpoint, so a host routing Claude through a proxy enables it with `ENABLE_TOOL_SEARCH=true` in `env` when the proxy forwards Anthropic requests unchanged.
+- Tools Pi declares to its model always load. Tools Pi keeps behind its own search (MCP servers set to `deferred` or `codemode` in `mcp.json`) wait behind Claude Code's tool search until Claude needs them; `hidden` tools and Pi's `tool_search` and `codemode` tools are not offered, because Claude Code's tool search replaces them. A deferred tool Claude loads and calls becomes active in Pi, so Pi's transcript declares it from then on. Claude Code turns tool search on by itself only for a first-party Anthropic endpoint, so a host routing Claude through a proxy enables it with `ENABLE_TOOL_SEARCH=true` in `env` when the proxy forwards Anthropic requests unchanged.
 - Opt-in forwarding of `APPEND_SYSTEM.md` and recognized Pi prompt hooks.
+
+## Requirements
+
+Bridge 2.x requires the Pi 1.x provider API as shipped by the fractaal fork 0.86 or newer. It relies on 0.86 resolving a call to a tool activated mid-turn, or registered with `deferred`/`codemode` exposure, in the same turn; upstream Pi 1.0.4 lacks that, so a deferred tool Claude loads would fail its first call there. Use bridge 1.12.x with Pi 0.85 and older.
 
 ## Install
 

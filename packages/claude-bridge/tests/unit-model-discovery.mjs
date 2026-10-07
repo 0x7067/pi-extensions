@@ -15,7 +15,13 @@ function memoryStore() {
   return {
     read: async () => structuredClone(value),
     write: async (entry) => { value = structuredClone(entry); },
-    delete: async () => { value = undefined; },
+    // Pi's refresh context: an immutable snapshot of the stored catalog, and publish() to persist.
+    context: (options = {}) => ({
+      signal: new AbortController().signal,
+      ...options,
+      stored: structuredClone(value),
+      publish: async ({ persist, update }) => { if (persist !== undefined) value = persist === null ? undefined : structuredClone(persist); update?.(); return true; },
+    }),
   };
 }
 
@@ -98,14 +104,14 @@ describe('Claude model discovery', () => {
   it('persists new models through Pi model storage and can restore them offline in a new runtime', async () => {
     const store = memoryStore();
     const catalog = createClaudeModelCatalog({ initialModels: [metadata('claude-existing')], discover: async () => discovery, fetchMetadata: async () => [metadata()] });
-    const result = await catalog.refresh({ allowNetwork: true, store });
+    const result = await catalog.refresh(store.context({ allowNetwork: true }));
     assert.ok(result.some(model => model.id === 'claude-new-model'));
     const restarted = createClaudeModelCatalog({
       initialModels: [metadata('claude-existing')],
       discover: async () => { throw new Error('offline discovery must not run'); },
       fetchMetadata: async () => { throw new Error('offline metadata must not run'); },
     });
-    assert.deepEqual(await restarted.refresh({ allowNetwork: false, store }), result);
+    assert.deepEqual(await restarted.refresh(store.context({ allowNetwork: false })), result);
     assert.equal((await store.read()).models.find(model => model.id === 'claude-new-model').provider, 'claude-bridge');
   });
 
@@ -113,8 +119,8 @@ describe('Claude model discovery', () => {
     const store = memoryStore();
     await store.write({ models: [{ ...metadata(), provider: 'claude-bridge', api: 'claude-bridge', baseUrl: 'claude-bridge' }] });
     const catalog = createClaudeModelCatalog({ initialModels: [], discover: async () => { throw new Error('discovery offline'); }, fetchMetadata: async () => [] });
-    await assert.rejects(catalog.refresh({ allowNetwork: true, force: true, store }), /discovery offline/);
-    assert.deepEqual((await catalog.refresh({ allowNetwork: false, store })).map(model => model.id), ['claude-new-model']);
+    await assert.rejects(catalog.refresh(store.context({ allowNetwork: true, force: true })), /discovery offline/);
+    assert.deepEqual((await catalog.refresh(store.context({ allowNetwork: false }))).map(model => model.id), ['claude-new-model']);
   });
 
   it('reports absent limits rather than inventing capabilities or prices for a new model', async () => {
@@ -123,7 +129,7 @@ describe('Claude model discovery', () => {
       initialModels: [metadata('claude-existing')], discover: async () => discovery,
       fetchMetadata: async () => [{ ...metadata(), contextWindow: -1 }], warn: message => warnings.push(message),
     });
-    assert.deepEqual((await catalog.refresh({ allowNetwork: true, store: memoryStore() })).map(model => model.id), ['claude-existing']);
+    assert.deepEqual((await catalog.refresh(memoryStore().context({ allowNetwork: true }))).map(model => model.id), ['claude-existing']);
     assert.ok(warnings.some(message => message.includes('claude-new-model')));
   });
 
@@ -134,10 +140,10 @@ describe('Claude model discovery', () => {
       initialModels: [], discover: async () => latest,
       fetchMetadata: async () => [metadata(), metadata('claude-another-model')],
     });
-    await catalog.refresh({ allowNetwork: true, store });
+    await catalog.refresh(store.context({ allowNetwork: true }));
     latest = [...latest, { value: 'claude-another-model', displayName: 'Another model', description: '' }];
-    assert.equal((await catalog.refresh({ allowNetwork: true, store })).length, 1);
-    const result = await catalog.refresh({ allowNetwork: true, force: true, store });
+    assert.equal((await catalog.refresh(store.context({ allowNetwork: true }))).length, 1);
+    const result = await catalog.refresh(store.context({ allowNetwork: true, force: true }));
     assert.deepEqual(result.map(model => model.id), ['claude-new-model', 'claude-another-model']);
   });
 });

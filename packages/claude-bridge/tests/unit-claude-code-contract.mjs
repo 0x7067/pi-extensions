@@ -8,7 +8,7 @@
  */
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readdirSync, rmSync, symlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -50,6 +50,7 @@ const APPLY_TOOL = {
 		required: ["change"],
 	},
 };
+const DEFERRED_APPLY = { ...APPLY_TOOL, exposure: "deferred" }; // registered in Pi, not declared to its model
 const APPLY_SDK_NAME = "mcp__custom-tools__mcp__aria__apply_change";
 const TOOL_SEARCH = { ENABLE_TOOL_SEARCH: "true" }; // the fake endpoint is not first-party
 
@@ -68,6 +69,13 @@ const assistantToolCall = (name, args) => ({
 const toolResult = (toolCall, text) => ({ role: "toolResult", toolCallId: toolCall.id, toolName: toolCall.name, content: [{ type: "text", text }], isError: false, timestamp: Date.now() });
 const toolCallsOf = (message) => message.content.filter((block) => block.type === "toolCall");
 const textOf = (message) => message.content.filter((block) => block.type === "text").map((block) => block.text).join("");
+const visibleParts = (message) => message.parts.map((part) => part.replace(/<system-reminder>[\s\S]*?<\/system-reminder>\n?/g, "").replace(/^\|/, "")).filter(Boolean);
+/** What a request offers Claude: tools sent upfront, and tools only listed behind ToolSearch. */
+const offeredTools = (request) => ({
+	upfront: request.body.tools.filter((tool) => !tool.defer_loading).map((tool) => tool.name),
+	deferred: request.messages.flatMap((message) => message.parts)
+		.flatMap((part) => part.includes("deferred tools are now available") ? part.split("\n").filter((line) => line.startsWith("mcp__")) : []),
+});
 const hasFakeReply = (request) => request.messages.some((message) => message.parts.some((part) => /No response requested/.test(part)));
 
 let workDir;
@@ -77,23 +85,69 @@ let respond;
 function newBridge(env) {
 	const handlers = new Map();
 	const notifications = [];
+	const registry = new Map(); // name -> { tool, exposure }
+	let active = [];
 	let provider;
 	const cwd = mkdtempSync(join(workDir, "session-"));
-	createClaudeBridgeExtension({ userDir: join(workDir, "user"), env })({
+	const pi = {
 		registerCommand() {},
 		on(event, handler) { handlers.set(event, handler); },
 		registerProvider(_id, config) { provider = config; },
 		appendEntry() {},
 		events: { emit() {} },
-	});
+		getAllTools: () => [...registry.values()].map(({ tool, exposure }) => ({ ...tool, exposure })),
+		getActiveTools: () => [...active],
+		setActiveTools(names) { active = [...new Set(names)].filter((name) => registry.has(name) && registry.get(name).exposure !== "hidden"); },
+	};
+	createClaudeBridgeExtension({ userDir: join(workDir, "user"), env })(pi);
 	handlers.get("session_start")?.({ reason: "new" }, { cwd, ui: { notify: (message, level) => notifications.push({ message, level }) } });
+	let declared; // tool names the transcript declares
+	let initial; // tool names the leading system message declares
+	const systemUpdates = []; // { after, message }: mid-transcript system messages, kept where Pi put them
 	return {
 		cwd,
 		notifications,
-		/** One provider call, as Pi's agent loop makes it. Resolves with the final assistant message. */
-		async call(model, messages, { signal, onEvent, tools = [LOOKUP_TOOL] } = {}) {
+		pi,
+		/** Tool names Pi's transcript declares to the model (what another provider would see). */
+		declaredTools: () => [...(declared ?? [])],
+		/** Pi runs a tool call; only an unknown or hidden tool is not found. */
+		runTool(toolCall, text = "ok") {
+			const known = registry.get(toolCall.name);
+			if (!known || known.exposure === "hidden") {
+				return { role: "toolResult", toolCallId: toolCall.id, toolName: toolCall.name, content: [{ type: "text", text: `Tool ${toolCall.name} not found` }], isError: true, timestamp: Date.now() };
+			}
+			return toolResult(toolCall, text);
+		},
+		/**
+		 * One provider call, as Pi's agent loop makes it. Resolves with the final assistant message.
+		 * `tools` sets the active tools on the first call and whenever given; `registered` adds tools
+		 * with another exposure ({ ...tool, exposure }); `systemPrompt` is Pi's prompt for this call.
+		 */
+		async call(model, messages, { signal, onEvent, tools, registered = [], systemPrompt = "You are a test assistant." } = {}) {
+			if (tools || !declared) {
+				const direct = tools ?? [LOOKUP_TOOL];
+				for (const tool of direct) registry.set(tool.name, { tool, exposure: "direct" });
+				for (const { exposure, ...tool } of registered) registry.set(tool.name, { tool, exposure });
+				active = direct.map((tool) => tool.name);
+			}
+			const toolOf = (name) => registry.get(name).tool;
+			if (!declared) { declared = [...active]; initial = [...active]; }
+			const added = active.filter((name) => !declared.includes(name));
+			if (added.length) {
+				// Pi declares newly active tools in a system message before its next request.
+				// Pi inserts it before a new prompt, and after tool results otherwise.
+				const after = messages.at(-1)?.role === "user" ? messages.length - 1 : messages.length;
+				systemUpdates.push({ after, message: { role: "system", content: "", toolsAdded: added.map(toolOf), timestamp: Date.now() } });
+				declared.push(...added);
+			}
+			const transcript = [{ role: "system", content: systemPrompt, toolsAdded: initial.map(toolOf), timestamp: Date.now() }];
+			messages.forEach((message, index) => {
+				for (const update of systemUpdates) if (update.after === index) transcript.push(update.message);
+				transcript.push(message);
+			});
+			for (const update of systemUpdates) if (update.after >= messages.length) transcript.push(update.message);
 			// Pi passes no cwd to providers; the session cwd comes from session_start.
-			const stream = provider.streamSimple(model, { systemPrompt: "You are a test assistant.", messages, tools }, { signal });
+			const stream = provider.streamSimple(model, { messages: transcript }, { signal });
 			let last;
 			for await (const event of stream) {
 				last = event;
@@ -308,12 +362,12 @@ describe("Claude Code contract", { timeout: 60_000, skip: claudeBinary ? false :
 		assert.equal(hasFakeReply(fakeApi.requests.at(-1)), false);
 	});
 
-	it("with tool search, Pi's own tools load upfront and tools bridged from MCP servers wait to be searched", async () => {
+	it("with tool search, tools Pi declares load upfront and deferred tools registered in Pi wait to be searched", async () => {
 		const bridge = newBridge(TOOL_SEARCH);
 		const start = fakeApi.requests.length;
 		respond = () => ({ text: "ok" });
 
-		await bridge.call(HAIKU, [user("hi")], { tools: [LOOKUP_TOOL, APPLY_TOOL] });
+		await bridge.call(HAIKU, [user("hi")], { tools: [LOOKUP_TOOL], registered: [DEFERRED_APPLY] });
 
 		const upfront = fakeApi.requests[start].body.tools.filter((tool) => !tool.defer_loading).map((tool) => tool.name);
 		assert.ok(upfront.includes("ToolSearch"));
@@ -331,7 +385,7 @@ describe("Claude Code contract", { timeout: 60_000, skip: claudeBinary ? false :
 		};
 
 		const history = [user("Remove grant g1.")];
-		const toolTurn = await bridge.call(HAIKU, history, { tools: [LOOKUP_TOOL, APPLY_TOOL] });
+		const toolTurn = await bridge.call(HAIKU, history, { tools: [LOOKUP_TOOL], registered: [DEFERRED_APPLY] });
 		const toolCalls = toolCallsOf(toolTurn);
 		assert.deepEqual(toolCalls.map((call) => call.name), ["mcp__aria__apply_change"]);
 		assert.deepEqual(toolCalls[0].arguments, { change: { operation: "delete_grant", grant_id: "g1" } });
@@ -340,7 +394,7 @@ describe("Claude Code contract", { timeout: 60_000, skip: claudeBinary ? false :
 		assert.deepEqual(loaded.input_schema, APPLY_TOOL.parameters, "the API must receive the tool's schema unchanged");
 
 		history.push(toolTurn, toolResult(toolCalls[0], "removed"));
-		const reply = await bridge.call(HAIKU, history, { tools: [LOOKUP_TOOL, APPLY_TOOL] });
+		const reply = await bridge.call(HAIKU, history);
 		assert.equal(textOf(reply), "Grant removed.");
 	});
 
@@ -355,12 +409,12 @@ describe("Claude Code contract", { timeout: 60_000, skip: claudeBinary ? false :
 		const earlier = assistantToolCall("mcp__aria__apply_change", { change: { operation: "delete_grant", grant_id: "g1" } });
 		const history = [user("Remove grant g1."), earlier, toolResult(earlier.content[0], "removed"), user("And g2?")];
 
-		const toolTurn = await bridge.call(HAIKU, history, { tools: [LOOKUP_TOOL, APPLY_TOOL] });
+		const toolTurn = await bridge.call(HAIKU, history, { tools: [LOOKUP_TOOL], registered: [DEFERRED_APPLY] });
 		const toolCalls = toolCallsOf(toolTurn);
 		assert.deepEqual(toolCalls.map((call) => call.arguments), [{ change: { operation: "delete_grant", grant_id: "g2" } }]);
 
 		history.push(toolTurn, toolResult(toolCalls[0], "removed"));
-		const reply = await bridge.call(HAIKU, history, { tools: [LOOKUP_TOOL, APPLY_TOOL] });
+		const reply = await bridge.call(HAIKU, history);
 		assert.equal(textOf(reply), "Grant g2 removed.");
 	});
 
@@ -369,11 +423,100 @@ describe("Claude Code contract", { timeout: 60_000, skip: claudeBinary ? false :
 		const start = fakeApi.requests.length;
 		respond = () => ({ text: "ok" });
 
-		await bridge.call(HAIKU, [user("hi")], { tools: [LOOKUP_TOOL, APPLY_TOOL] });
+		await bridge.call(HAIKU, [user("hi")], { tools: [LOOKUP_TOOL], registered: [DEFERRED_APPLY] });
 
 		const tools = fakeApi.requests[start].body.tools;
 		assert.equal(tools.some((tool) => tool.name === "ToolSearch" || tool.defer_loading), false);
 		assert.deepEqual(tools.find((tool) => tool.name === APPLY_SDK_NAME).input_schema, APPLY_TOOL.parameters);
+	});
+
+	it("tools Pi declares load upfront; deferred and codemode tools wait behind ToolSearch; Pi's own search tools and hidden tools are not offered", async () => {
+		const bridge = newBridge(TOOL_SEARCH);
+		const start = fakeApi.requests.length;
+		respond = () => ({ text: "ok" });
+		const tool = (name) => ({ name, description: `The ${name} tool.`, parameters: { type: "object", properties: {} } });
+
+		await bridge.call(HAIKU, [user("hi")], {
+			tools: [LOOKUP_TOOL, tool("tool_search"), tool("codemode")],
+			registered: [
+				{ ...tool("mcp__dev__deferred_one"), exposure: "deferred" },
+				{ ...tool("mcp__dev__codemode_one"), exposure: "codemode" },
+				{ ...tool("mcp__dev__hidden_one"), exposure: "hidden" },
+			],
+		});
+
+		const sdk = (name) => `mcp__custom-tools__${name}`;
+		const { upfront, deferred } = offeredTools(fakeApi.requests[start]);
+		assert.ok(upfront.includes("ToolSearch"), "Claude Code's ToolSearch is the only search mechanism");
+		assert.ok(upfront.includes(sdk("lookup")), "a declared tool loads upfront");
+		assert.deepEqual(deferred.sort(), [sdk("mcp__dev__codemode_one"), sdk("mcp__dev__deferred_one")]);
+		const everything = JSON.stringify(fakeApi.requests[start]);
+		for (const name of ["tool_search", "codemode", "hidden_one"]) assert.equal(everything.includes(sdk(name)), false, `${name} must not reach Claude`);
+	});
+
+	it("Pi's system prompt reaches Claude in pi mode", async () => {
+		const userDir = join(workDir, "user");
+		mkdirSync(userDir, { recursive: true });
+		writeFileSync(join(userDir, "claude-bridge.json"), JSON.stringify({ provider: { systemPromptMode: "pi" } }));
+		try {
+			const bridge = newBridge();
+			const start = fakeApi.requests.length;
+			respond = () => ({ text: "ok" });
+			await bridge.call(HAIKU, [user("hi")], { systemPrompt: "You are PiPromptMarker-7731, Pi's own prompt." });
+			const system = JSON.stringify(fakeApi.requests[start].body.system);
+			assert.match(system, /PiPromptMarker-7731/);
+			assert.doesNotMatch(system, /Claude Code, Anthropic's official CLI/);
+		} finally {
+			rmSync(join(userDir, "claude-bridge.json"), { force: true });
+		}
+	});
+
+	it("a deferred tool Claude loads and calls runs in Pi and is recorded there as active", async () => {
+		const bridge = newBridge(TOOL_SEARCH);
+		const start = fakeApi.requests.length;
+		const input = { change: { operation: "delete_grant", grant_id: "g1" } };
+		respond = (_request, index) => {
+			if (index === start) return { toolUse: { id: "toolu_load_1", name: "ToolSearch", input: { query: `select:${APPLY_SDK_NAME}`, max_results: 1 } } };
+			if (index === start + 1) return { toolUse: { id: "toolu_apply_a", name: APPLY_SDK_NAME, input } };
+			return { text: "Grant removed." };
+		};
+		const history = [user("Remove grant g1.")];
+
+		// Claude's call reaches Pi, which runs it and records the tool as active.
+		const first = await bridge.call(HAIKU, history, { tools: [LOOKUP_TOOL], registered: [DEFERRED_APPLY] });
+		const [firstCall] = toolCallsOf(first);
+		assert.equal(firstCall.name, APPLY_TOOL.name);
+		assert.ok(bridge.pi.getActiveTools().includes(APPLY_TOOL.name), "the call must activate the tool in Pi");
+		const ran = bridge.runTool(firstCall, "removed");
+		assert.equal(ran.isError, false);
+
+		history.push(first, ran);
+		const reply = await bridge.call(HAIKU, history);
+		assert.equal(textOf(reply), "Grant removed.");
+		assert.ok(fakeApi.requests.at(-1).messages.at(-1).parts.some((part) => part.startsWith("tool_result:removed")));
+		// What Pi's transcript declares, and so what another model (for example Codex) is offered.
+		assert.deepEqual(bridge.declaredTools().sort(), ["lookup", APPLY_TOOL.name].sort());
+	});
+
+	it("Pi system messages in the transcript do not disturb the shared Claude session between turns", async () => {
+		const bridge = newBridge();
+		const start = fakeApi.requests.length;
+		respond = (_request, index) => ({ text: index === start ? "CLAUDE-VERSION" : "second answer" });
+		const first = await bridge.call(HAIKU, [user("one")], { tools: [LOOKUP_TOOL], registered: [DEFERRED_APPLY] });
+		assert.equal(textOf(first), "CLAUDE-VERSION");
+
+		// Pi activates a tool between turns: a system message lands between the turns' messages.
+		bridge.pi.setActiveTools(["lookup", APPLY_TOOL.name]);
+		// Pi's history differs from Claude's copy in wording only; reuse keeps Claude's own, a rebuild would use Pi's.
+		const history = [user("one"), assistantReply("PI-VERSION"), user("two")];
+		await bridge.call(HAIKU, history);
+		const sent = fakeApi.requests.at(-1).messages.map((message) => visibleParts(message).join("|"));
+		assert.deepEqual(sent, ["one", "CLAUDE-VERSION", "two"]);
+
+		// A third turn with another system message is still a reuse.
+		bridge.pi.setActiveTools(["lookup"]);
+		await bridge.call(HAIKU, [...history, assistantReply("PI-VERSION-2"), user("three")]);
+		assert.deepEqual(fakeApi.requests.at(-1).messages.map((message) => visibleParts(message).join("|")), ["one", "CLAUDE-VERSION", "two", "second answer", "three"]);
 	});
 
 	it("Claude Code runs in the Pi session's working directory, not the host process's", async () => {
