@@ -7,6 +7,7 @@ import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { preflightClaudeExecutable, spawnClaudeCodeWithDiagnostics } from "../src/index.ts";
@@ -126,7 +127,7 @@ describe("preflightClaudeExecutable", () => {
 
 	it("stops Claude Code when the bridge host disappears", async () => withTempDir(async (dir) => {
 		const pidFile = join(dir, "child.pid");
-		const bundle = join(new URL("..", import.meta.url).pathname, "bundle", "index.js");
+		const bundle = join(fileURLToPath(new URL("..", import.meta.url)), "bundle", "index.js");
 		const host = spawn(process.execPath, [
 			"--input-type=module",
 			"-e",
