@@ -29,6 +29,7 @@ import { loadConfig, normalizeEffortLevel, recordProjectTrust, type Config } fro
 import { extractAgentsAppend } from "./agents-md.js";
 import { buildPromptContextAppend } from "./prompt-context.js";
 import { resolveGetModels } from "./pi-ai-compat.js";
+import { parseSupervisorError, SUPERVISOR_PID_PREFIX, SUPERVISOR_SCRIPT, supervisorEnvironment } from "./process-supervisor.js";
 
 // Compat (#2): use factory if available (pi-ai ≥0.66), else fall back to constructor (gsd-pi etc.)
 const _piAi = piAi as any;
@@ -274,20 +275,34 @@ export function wrapClaudeSpawnErrorForSdk(err: Error, options: SpawnOptions): E
 
 export function spawnClaudeCodeWithDiagnostics(options: SpawnOptions): SpawnedProcess {
 	const pipeStderr = DEBUG || envFlagEnabled(options.env.DEBUG_CLAUDE_AGENT_SDK);
-	const child = spawnProcess(options.command, options.args, {
+	// Node has no pre-exec hook for PR_SET_PDEATHSIG. A tiny Node supervisor is
+	// therefore the child owned by the SDK: it forwards the pipes and kills
+	// Claude Code after its bridge parent disappears, including a hard host kill.
+	const child = spawnProcess(process.execPath, ["-e", SUPERVISOR_SCRIPT], {
 		cwd: options.cwd,
-		env: options.env,
+		env: supervisorEnvironment(options.command, options.args, options.env, options.cwd),
 		signal: options.signal,
-		stdio: ["pipe", "pipe", pipeStderr ? "pipe" : "ignore"],
+		stdio: ["pipe", "pipe", "pipe"],
+		detached: process.platform !== "win32",
 		windowsHide: true,
 	});
-	if (pipeStderr) {
-		child.stderr?.on("data", (data) => {
-			for (const line of data.toString().split(/\r?\n/)) {
-				if (line) debug(`[cli-stderr spawn] ${line}`);
+	let stderrBuffer = "";
+	let reportedChildError = false;
+	child.stderr?.on("data", (data) => {
+		stderrBuffer += data.toString();
+		const lines = stderrBuffer.split(/\r?\n/);
+		stderrBuffer = lines.pop() ?? "";
+		for (const line of lines) {
+			const reported = parseSupervisorError(line);
+			if (reported) {
+				reportedChildError = true;
+				const error = Object.assign(new Error(reported.message), reported);
+				child.emit("error", error);
+				continue;
 			}
-		});
-	}
+			if (!line.startsWith(SUPERVISOR_PID_PREFIX) && pipeStderr) debug(`[cli-stderr spawn] ${line}`);
+		}
+	});
 	child.prependListener("error", (err) => {
 		const originalStack = err.stack;
 		const wrapped = wrapClaudeSpawnErrorForSdk(err, options);
@@ -299,12 +314,35 @@ export function spawnClaudeCodeWithDiagnostics(options: SpawnOptions): SpawnedPr
 		// JSON-serializable; stack stays the spawn-time breadcrumb for operators.
 		if (originalStack) err.stack = originalStack;
 	});
+	child.once("close", () => {
+		if (stderrBuffer) {
+			const reported = parseSupervisorError(stderrBuffer);
+			if (reported && !reportedChildError) {
+				const error = Object.assign(new Error(reported.message), reported);
+				child.emit("error", error);
+			}
+		}
+	});
+	const kill = (signal: NodeJS.Signals): boolean => {
+		// The supervisor is a detached process-group leader on POSIX. Killing the
+		// group also kills Claude Code when the SDK asks for SIGKILL, which the
+		// supervisor cannot catch and forward itself.
+		if (process.platform !== "win32" && child.pid) {
+			try {
+				process.kill(-child.pid, signal);
+				return true;
+			} catch {
+				// The group may already have exited; let Node report the direct result.
+			}
+		}
+		return child.kill(signal);
+	};
 	return {
 		stdin: child.stdin,
 		stdout: child.stdout,
 		get killed() { return child.killed; },
 		get exitCode() { return child.exitCode; },
-		kill: child.kill.bind(child),
+		kill,
 		on: child.on.bind(child),
 		once: child.once.bind(child),
 		off: child.off.bind(child),
@@ -496,9 +534,12 @@ interface SessionState {
 	forceRotate?: boolean;
 }
 
+type BridgeQuery = Pick<ReturnType<typeof query>, "interrupt" | "close">;
+
 interface BridgeRuntimeState {
 	sharedSession: SessionState | null;
 	extensionApi: ExtensionAPI | undefined;
+	activeQueries: Set<BridgeQuery>;
 	piUI: ExtensionUIContext | undefined;
 	extraUsageHelperInFlight: Promise<string> | null;
 	query: QueryRuntimeState;
@@ -514,6 +555,7 @@ function createBridgeRuntimeState(userDir?: string, env?: NodeJS.ProcessEnv): Br
 	const runtime: BridgeRuntimeState = {
 		sharedSession: null,
 		extensionApi: undefined,
+		activeQueries: new Set(),
 		piUI: undefined,
 		extraUsageHelperInFlight: null,
 		query: createQueryRuntimeState(),
@@ -2167,6 +2209,7 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 	let released = false;
 	const sdkQuery = query({ prompt: input, options: queryOptions });
 	ctx().activeQuery = sdkQuery;
+	bridgeRuntime().activeQueries.add(sdkQuery);
 
 	// 5. Capture context for abort handling (must be AFTER pushContext)
 	const abortCtx = ctx();
@@ -2267,6 +2310,7 @@ export function streamClaudeAgentSdk(model: Model<any>, context: Context, option
 		streamIdleWatchdog?.dispose();
 		activeStreamIdleWatchdogs.delete(abortCtx);
 		if (options?.signal) options.signal.removeEventListener("abort", onAbort);
+		bridgeRuntime().activeQueries.delete(sdkQuery);
 		if (abortCtx.activeQuery !== sdkQuery) return;
 		reportToolResultMismatch(abortCtx, "query teardown", cwd, { forceRotate: wasAborted || options?.signal?.aborted || streamIdleTimedOut });
 		// Drain pending handlers for this query
@@ -2424,6 +2468,13 @@ function registerClaudeBridge(pi: ExtensionAPI, options: ClaudeBridgeExtensionOp
 			return;
 		}
 
+		const closeActiveQueries = (event: string) => {
+			for (const activeQuery of bridgeRuntime().activeQueries) {
+				debug(`${event}: closing active Claude Code query`);
+				void activeQuery.interrupt().catch(() => {});
+				try { activeQuery.close(); } catch {}
+			}
+		};
 		const clearSession = (event: string) => {
 			debug(`${event}: clearing session ${bridgeRuntime().sharedSession?.sessionId?.slice(0, 8) ?? "none"}`);
 			bridgeRuntime().sharedSession = null;
@@ -2446,7 +2497,10 @@ function registerClaudeBridge(pi: ExtensionAPI, options: ClaudeBridgeExtensionOp
 			// A fork rebuilds from Pi history; it must not resume the parent's Claude JSONL.
 			if (event.reason === "startup" || event.reason === "resume") restoreSharedSessionFromPi(ctx);
 		}));
-		pi.on("session_shutdown", () => run(() => clearSession("session_shutdown")));
+		pi.on("session_shutdown", () => run(() => {
+			closeActiveQueries("session_shutdown");
+			clearSession("session_shutdown");
+		}));
 		pi.on("message_end", (event, ctx) => run(() => {
 			const message = (event as { message?: AssistantMessage }).message;
 			if (message?.role === "assistant" && message.provider === PROVIDER_ID) schedulePersistSharedSession(ctx);
