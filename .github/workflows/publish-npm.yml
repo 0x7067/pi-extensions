@@ -93,6 +93,6 @@ jobs:
           publish_args=(--workspace "${PACKAGE}" --access public --provenance)
           # The v1 maintenance line is intentionally below the v2 latest tag.
           if [[ "${VERSION%%.*}" == "1" ]]; then
-            publish_args+=(--tag v1)
+            publish_args+=(--tag legacy-v1)
           fi
           npm publish "${publish_args[@]}"
