@@ -192,8 +192,8 @@
     }
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "npm:@fractaal/pi-ai@0.86.0",
-    "@earendil-works/pi-coding-agent": "npm:@fractaal/pi-coding-agent@0.86.0",
+    "@earendil-works/pi-ai": "npm:@fractaal/pi-ai@0.86.1",
+    "@earendil-works/pi-coding-agent": "npm:@fractaal/pi-coding-agent@0.86.1",
     "@types/node": "24.13.3",
     "esbuild": "0.28.1",
     "tsx": "4.23.1",
