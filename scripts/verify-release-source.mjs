@@ -11,7 +11,7 @@ export function parseReleaseTag(tag) {
   // A failed publish can leave an immutable, unpublished tag. A suffix gives the
   // OIDC workflow a new protected tag to retry the same package version without
   // moving the original release tag.
-  const releaseTag = tag.endsWith('-republish') ? tag.slice(0, -'-republish'.length) : tag;
+  const releaseTag = tag.replace(/-republish\d*$/, '');
   const match = RELEASE_TAG.exec(releaseTag);
   if (!match) {
     throw new Error(`Release tag must be <package-directory>-v<semver>; received ${JSON.stringify(tag)}.`);
