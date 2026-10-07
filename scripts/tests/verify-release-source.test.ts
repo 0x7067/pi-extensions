@@ -63,7 +63,7 @@ describe('release source verification', () => {
   });
 
   it('parses a republish tag as the same package version', () => {
-    expect(parseReleaseTag('directive-roots-v0.1.1-republish')).toEqual({ workspace: 'directive-roots', version: '0.1.1' });
+    expect(parseReleaseTag('directive-roots-v0.1.1-republish2')).toEqual({ workspace: 'directive-roots', version: '0.1.1' });
   });
 
   it('rejects malformed and path-like release tags', () => {
